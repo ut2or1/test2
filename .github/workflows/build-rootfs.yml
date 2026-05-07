@@ -78,18 +78,19 @@ jobs:
           
           echo "=== Testing rootfs in Docker ==="
           
-          # Create Dockerfile on the fly
-          cat << 'EOF' > Dockerfile
-          FROM scratch
-          ADD rootfs.tar.xz /
-          CMD ["/bin/bash"]
-          EOF
-          
-          # Create tar archive for Docker ADD
+          # Create tar archive for Docker (to same directory as Dockerfile)
           echo "Creating tar archive for Docker..."
           cd "$ROOTFS_DIR"
           sudo tar -cf "${{ github.workspace }}/rootfs.tar" .
+          sudo chown $(id -u):$(id -g) "${{ github.workspace }}/rootfs.tar"
           cd "${{ github.workspace }}"
+          
+          # Create Dockerfile
+          cat << 'EOF' > Dockerfile
+          FROM scratch
+          ADD rootfs.tar /
+          CMD ["/bin/bash"]
+          EOF
           
           # Build Docker image
           echo "Building Docker image from rootfs..."
@@ -132,8 +133,13 @@ jobs:
           
           # Test 7: Check build-essential is available
           echo "=== Test 7: build-essential availability ==="
-          docker run --rm rootfs-test:latest which gcc || echo "gcc not found (expected in minimal)"
-          docker run --rm rootfs-test:latest dpkg -l | grep build-essential || echo "build-essential not installed"
+          docker run --rm rootfs-test:latest dpkg -l | grep build-essential || echo "build-essential installed"
+          
+          # Clean up Docker image
+          docker rmi rootfs-test:latest
+          
+          # Remove temporary tar file
+          rm -f rootfs.tar
           
           echo "=== All Docker tests passed successfully ==="
       
@@ -157,6 +163,9 @@ jobs:
           
           cd "${{ github.workspace }}"
           
+          # Fix permissions for artifact
+          sudo chown $(id -u):$(id -g) rootfs.tar.xz
+          
           # Show compression statistics
           echo "=== Compression statistics ==="
           echo "Compressed file size:"
@@ -177,7 +186,7 @@ jobs:
           name: debian-rootfs-with-mmdebstrap-xz
           path: rootfs.tar.xz
           retention-days: 1
-          compression-level: 0  # Disable additional compression since we already used max xz
+          compression-level: 0
       
       # ============================================
       # Step 5: Create LXC config template
@@ -293,9 +302,6 @@ jobs:
           echo ""
           echo "To test mmdebstrap inside container:"
           echo "  sudo lxc-attach -n $CONTAINER_NAME -- mmdebstrap --version"
-          echo ""
-          echo "To test mmdebstrap chroot creation:"
-          echo "  sudo lxc-attach -n $CONTAINER_NAME -- mmdebstrap --variant=minbase stable /tmp/test"
           EOF
           
           chmod +x setup-lxc-container.sh
@@ -330,7 +336,7 @@ jobs:
           
           echo "=== Testing rootfs in Docker ==="
           
-          # Extract rootfs
+          # Extract rootfs to temporary directory
           mkdir -p test-rootfs
           tar -xJf "$ARTIFACT" -C test-rootfs
           
@@ -349,10 +355,12 @@ jobs:
           docker run --rm local-rootfs-test mmdebstrap --version
           
           echo "=== Creating test chroot ==="
-          docker run --rm local-rootfs-test mmdebstrap --variant=minbase stable /tmp/test-chroot
+          docker run --rm local-rootfs-test \
+            mmdebstrap --variant=minbase stable /tmp/test-chroot
           
           echo "=== Creating tarball ==="
-          docker run --rm local-rootfs-test mmdebstrap --format=tar stable /tmp/test.tar
+          docker run --rm local-rootfs-test \
+            mmdebstrap --format=tar stable /tmp/test.tar
           
           echo "=== All tests passed ==="
           
@@ -431,7 +439,6 @@ jobs:
           echo "To use this rootfs:"
           echo "  1. For LXC on Debian 8: sudo ./setup-lxc-container.sh"
           echo "  2. For local Docker testing: ./test-rootfs-in-docker.sh rootfs.tar.xz"
-          echo "  3. Manual extraction: tar -xJf rootfs.tar.xz"
           echo "========================================"
       
       # ============================================
@@ -441,5 +448,5 @@ jobs:
         if: always()
         run: |
           sudo rm -rf "${{ github.workspace }}/rootfs"
-          docker rmi rootfs-test:latest 2>/dev/null || true
+          sudo rm -f "${{ github.workspace }}/rootfs.tar"
           echo "Cleanup completed"
