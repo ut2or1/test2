@@ -16,12 +16,11 @@ jobs:
         uses: actions/checkout@v4
       
       # ============================================
-      # Step 1: Install dependencies
+      # Step 1: Install dependencies (no apt-update)
       # ============================================
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             cdebootstrap-static \
             qemu-user-static \
             qemu-system-x86 \
@@ -29,7 +28,9 @@ jobs:
             binfmt-support \
             wget \
             xz-utils \
-            systemd-container
+            systemd-container \
+            extlinux \
+            syslinux
             
           echo "=== Verifying installations ==="
           cdebootstrap-static --version
@@ -90,28 +91,24 @@ jobs:
           echo "=== Test 1: mmdebstrap version ==="
           sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --version
           
-          # Test 2: Check apt works
-          echo "=== Test 2: apt update ==="
-          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/apt-get update
-          
-          # Test 3: Check essential packages
-          echo "=== Test 3: Essential packages ==="
+          # Test 2: Check essential packages
+          echo "=== Test 2: Essential packages ==="
           sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/dpkg -l | head -20
           
-          # Test 4: mmdebstrap help (non-privileged operation)
-          echo "=== Test 4: mmdebstrap help ==="
+          # Test 3: mmdebstrap help (non-privileged operation)
+          echo "=== Test 3: mmdebstrap help ==="
           sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --help | head -20
           
-          # Test 5: Check mmdebstrap variants
-          echo "=== Test 5: mmdebstrap variants ==="
+          # Test 4: Check mmdebstrap variants
+          echo "=== Test 4: mmdebstrap variants ==="
           sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --help | grep -A5 "variant"
           
-          # Test 6: Check mmdebstrap formats
-          echo "=== Test 6: mmdebstrap formats ==="
+          # Test 5: Check mmdebstrap formats
+          echo "=== Test 5: mmdebstrap formats ==="
           sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --help | grep -A10 "format"
           
-          # Test 7: Verify mmdebstrap dependencies
-          echo "=== Test 7: mmdebstrap dependencies ==="
+          # Test 6: Verify mmdebstrap dependencies
+          echo "=== Test 6: mmdebstrap dependencies ==="
           sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/dpkg -l | grep -E "(apt|dpkg|perl)"
           
           echo "=== All qemu-user-static tests passed successfully ==="
@@ -153,7 +150,7 @@ jobs:
           # Install kernel if not present
           if [ ! -f "$MOUNT_DIR/boot/vmlinuz-"* ]; then
             echo "Warning: No kernel found, installing..."
-            sudo chroot "$MOUNT_DIR" apt-get install -y linux-image-amd64
+            sudo chroot "$MOUNT_DIR" apt-get install -y --no-install-recommends linux-image-amd64
           fi
           
           # Create extlinux config
@@ -194,7 +191,7 @@ jobs:
           ls -lh "$IMAGE_FILE.xz"
       
       # ============================================
-      # Step 5: Archive artifacts
+      # Step 5: Archive artifacts (retention 1 day)
       # ============================================
       - name: Archive rootfs tarball
         run: |
@@ -249,8 +246,7 @@ jobs:
           # Install qemu-user-static if not present
           if ! command -v qemu-x86_64-static &> /dev/null; then
             echo "Installing qemu-user-static..."
-            sudo apt-get update
-            sudo apt-get install -y qemu-user-static binfmt-support
+            sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support
           fi
           
           # Extract rootfs
@@ -264,9 +260,6 @@ jobs:
           # Run tests
           echo "=== mmdebstrap version ==="
           sudo chroot "$TEMP_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --version
-          
-          echo "=== apt update ==="
-          sudo chroot "$TEMP_DIR" /usr/bin/qemu-x86_64-static /usr/bin/apt-get update
           
           echo "=== Cleanup ==="
           sudo rm -rf "$TEMP_DIR"
@@ -427,18 +420,18 @@ jobs:
           echo "✓ qemu-user-static installed (CI testing)"
           echo "✓ qemu-system installed (local VM testing)"
           echo "✓ Debian rootfs created with mmdebstrap"
-          echo "✓ Rootfs tested with qemu-user-static (7 tests)"
+          echo "✓ Rootfs tested with qemu-user-static (6 tests)"
           echo "  - mmdebstrap version"
-          echo "  - apt update"
           echo "  - Essential packages"
           echo "  - mmdebstrap help"
           echo "  - mmdebstrap variants"
           echo "  - mmdebstrap formats"
           echo "  - Dependencies check"
           echo "✓ Bootable QEMU disk image created"
+          echo "✓ Artifacts retention: 1 day"
           echo "========================================"
           echo ""
-          echo "Artifacts available for download:"
+          echo "Artifacts available for download (expire in 1 day):"
           echo "  1. debian-rootfs-tarball.tar.xz - Rootfs tarball"
           echo "  2. debian-rootfs-qemu-image.img.xz - Bootable QEMU disk"
           echo "  3. local-testing-scripts - Helper scripts"
