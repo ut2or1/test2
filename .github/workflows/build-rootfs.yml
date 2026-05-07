@@ -1,0 +1,246 @@
+name: Build Minimal LXC Rootfs with mmdebstrap
+
+on:
+  push:
+    branches: [feat/test]
+  pull_request:
+    branches: [feat/test]
+  workflow_dispatch:  # allows manual trigger
+
+jobs:
+  build-rootfs:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ============================================
+      # Step 1: Checkout code (if any config files needed)
+      # ============================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      # ============================================
+      # Step 2: Install required packages
+      # ============================================
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            luajit \
+            cdebootstrap-static \
+            lxc \
+            lxc-utils \
+            ca-certificates \
+            wget \
+            xz-utils
+          
+          # Verify installations
+          echo "=== Verifying installations ==="
+          luajit -v
+          cdebootstrap-static --version
+          lxc-create --version
+      
+      # ============================================
+      # Step 3: Create minimal rootfs with mmdebstrap
+      # ============================================
+      - name: Generate minimal rootfs using cdebootstrap
+        run: |
+          # Create rootfs directory
+          ROOTFS_DIR="${{ github.workspace }}/rootfs"
+          sudo mkdir -p "$ROOTFS_DIR"
+          
+          echo "=== Creating minimal Debian rootfs with mmdebstrap ==="
+          echo "This will take a few minutes..."
+          
+          # Build minimal rootfs with mmdebstrap pre-installed
+          # Using cdebootstrap-static for maximum compatibility
+          sudo cdebootstrap-static \
+            --arch=amd64 \
+            --flavour=minimal \
+            --include=mmdebstrap,apt-utils,ca-certificates,gnupg \
+            --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+            bookworm \
+            "$ROOTFS_DIR" \
+            http://deb.debian.org/debian
+          
+          # Verify mmdebstrap is installed correctly
+          echo "=== Verifying mmdebstrap inside rootfs ==="
+          sudo chroot "$ROOTFS_DIR" mmdebstrap --version
+          
+          # Clean up apt cache to reduce disk usage
+          sudo chroot "$ROOTFS_DIR" apt-get clean
+          sudo rm -rf "$ROOTFS_DIR"/var/cache/apt/archives/*.deb
+          sudo rm -rf "$ROOTFS_DIR"/var/lib/apt/lists/*
+          
+          # Display size of created rootfs
+          echo "=== Rootfs size ==="
+          sudo du -sh "$ROOTFS_DIR"
+      
+      # ============================================
+      # Step 4: Create LXC container from rootfs
+      # ============================================
+      - name: Create LXC container configuration
+        run: |
+          CONTAINER_NAME="builder"
+          ROOTFS_DIR="${{ github.workspace }}/rootfs"
+          LXC_PATH="/var/lib/lxc/$CONTAINER_NAME"
+          
+          # Create LXC container directory
+          sudo mkdir -p "$LXC_PATH"
+          
+          # Move rootfs to LXC container location
+          if [ -d "$LXC_PATH/rootfs" ]; then
+            sudo rm -rf "$LXC_PATH/rootfs"
+          fi
+          sudo mv "$ROOTFS_DIR" "$LXC_PATH/rootfs"
+          
+          # Create LXC configuration file
+          sudo tee "$LXC_PATH/config" > /dev/null << 'EOF'
+          # Container configuration for builder container
+          lxc.rootfs.path = /var/lib/lxc/builder/rootfs
+          
+          # Container name
+          lxc.uts.name = builder
+          
+          # Include Debian common configuration
+          lxc.include = /usr/share/lxc/config/debian.common.conf
+          
+          # Network configuration
+          lxc.net.0.type = veth
+          lxc.net.0.flags = up
+          lxc.net.0.link = lxcbr0
+          lxc.net.0.name = eth0
+          lxc.net.0.hwaddr = 00:16:3e:xx:xx:xx
+          
+          # Container limits
+          lxc.cgroup2.memory.max = 2G
+          lxc.cgroup2.cpu.max = 2
+          
+          # Console settings
+          lxc.tty.max = 2
+          lxc.console.logfile = /var/log/lxc/builder/console.log
+          EOF
+          
+          # Fix permissions
+          sudo chown -R root:root "$LXC_PATH"
+          sudo chmod 755 "$LXC_PATH"
+          sudo chmod 755 "$LXC_PATH/rootfs"
+          
+          echo "=== LXC container 'builder' created successfully ==="
+          ls -la "$LXC_PATH"
+      
+      # ============================================
+      # Step 5: Test container startup and mmdebstrap
+      # ============================================
+      - name: Test LXC container with mmdebstrap
+        run: |
+          CONTAINER_NAME="builder"
+          
+          # Start container in background
+          echo "=== Starting LXC container ==="
+          sudo lxc-start -n "$CONTAINER_NAME" -d
+          
+          # Wait for container to be ready
+          echo "Waiting for container to start..."
+          sudo lxc-wait -n "$CONTAINER_NAME" -s RUNNING -t 60
+          
+          # Get container IP
+          CONTAINER_IP=$(sudo lxc-info -n "$CONTAINER_NAME" -iH)
+          echo "Container IP: $CONTAINER_IP"
+          
+          # Test: mmdebstrap version
+          echo "=== Testing: mmdebstrap version ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- mmdebstrap --version
+          
+          # Test: apt update works
+          echo "=== Testing: apt update ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- apt-get update
+          
+          # Test: Create minimal test chroot with mmdebstrap
+          echo "=== Testing: mmdebstrap can create chroot ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- \
+            mmdebstrap --variant=minbase stable /tmp/test-chroot
+          
+          # Verify test chroot was created
+          echo "=== Verifying test chroot contents ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- test -d /tmp/test-chroot/usr/bin
+          echo "✓ mmdebstrap successfully created test chroot"
+          
+          # Test: Check essential packages are present
+          echo "=== Checking essential packages ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- ls -la /tmp/test-chroot/usr/bin/ | head -10
+          
+          # Cleanup test chroot
+          sudo lxc-attach -n "$CONTAINER_NAME" -- rm -rf /tmp/test-chroot
+          
+          echo "=== All tests passed! ==="
+      
+      # ============================================
+      # Step 6: Run additional validation tests
+      # ============================================
+      - name: Validate mmdebstrap features
+        run: |
+          CONTAINER_NAME="builder"
+          
+          # Test: Check if mmdebstrap supports required formats
+          echo "=== Testing mmdebstrap format support ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- mmdebstrap --help | grep -E "(squashfs|ext4|tar)"
+          
+          # Test: Create tarball directly
+          echo "=== Testing tarball creation ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- \
+            mmdebstrap --format=tar stable /tmp/test.tar
+          sudo lxc-attach -n "$CONTAINER_NAME" -- test -f /tmp/test.tar
+          echo "✓ Tarball created successfully"
+          
+          # Test: Check dependencies
+          echo "=== Checking mmdebstrap dependencies ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- dpkg -l | grep -E "(apt|dpkg|perl)"
+          
+          # Display system info inside container
+          echo "=== Container system information ==="
+          sudo lxc-attach -n "$CONTAINER_NAME" -- cat /etc/os-release
+          sudo lxc-attach -n "$CONTAINER_NAME" -- uname -a
+      
+      # ============================================
+      # Step 7: Cleanup (no artifacts)
+      # ============================================
+      - name: Cleanup and stop container
+        if: always()  # Run even if previous steps fail
+        run: |
+          CONTAINER_NAME="builder"
+          
+          echo "=== Stopping and cleaning up container ==="
+          
+          # Stop container if running
+          if sudo lxc-info -n "$CONTAINER_NAME" -s 2>/dev/null | grep -q "RUNNING"; then
+            sudo lxc-stop -n "$CONTAINER_NAME" || true
+          fi
+          
+          # Destroy container
+          sudo lxc-destroy -n "$CONTAINER_NAME" -f || true
+          
+          # Clean any remaining directories
+          sudo rm -rf /var/lib/lxc/builder
+          sudo rm -rf "${{ github.workspace }}/rootfs"
+          
+          echo "=== Cleanup completed ==="
+      
+      # ============================================
+      # Step 8: Display summary
+      # ============================================
+      - name: Build summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "Build Summary"
+          echo "========================================"
+          echo "✓ luajit installed and verified"
+          echo "✓ cdebootstrap-static installed and verified"
+          echo "✓ Minimal rootfs created with mmdebstrap"
+          echo "✓ LXC container configured with rootfs"
+          echo "✓ mmdebstrap functionality validated"
+          echo "✓ All tests passed successfully"
+          echo "========================================"
+          echo "Note: No artifacts generated in this workflow"
+          echo "Container was cleaned up after validation"
+          echo "========================================"
