@@ -86,11 +86,11 @@ jobs:
           ls -lh rootfs-docker.tar
       
       # ============================================
-      # Step 4: Test rootfs in Docker
+      # Step 4: Test rootfs in Docker (with privileged mode)
       # ============================================
       - name: Test rootfs in Docker container
         run: |
-          echo "=== Testing rootfs in Docker ==="
+          echo "=== Testing rootfs in Docker (privileged mode) ==="
           
           # Create Dockerfile
           cat << 'EOF' > Dockerfile
@@ -103,42 +103,45 @@ jobs:
           echo "Building Docker image from rootfs..."
           docker build -t rootfs-test:latest .
           
-          # Test 1: Check mmdebstrap version
+          # Test 1: Check mmdebstrap version (doesn't need privileges)
           echo "=== Test 1: mmdebstrap version ==="
           docker run --rm rootfs-test:latest mmdebstrap --version
           
-          # Test 2: Check essential directories
+          # Test 2: Check essential directories (doesn't need privileges)
           echo "=== Test 2: Essential directories ==="
           docker run --rm rootfs-test:latest ls -la /usr/bin/ | head -10
           docker run --rm rootfs-test:latest test -d /etc/apt
           echo "✓ Essential directories present"
           
-          # Test 3: Check apt works
+          # Test 3: Check apt update (needs network, but not privileged)
           echo "=== Test 3: apt update ==="
           docker run --rm rootfs-test:latest apt-get update
           
+          # Test 4-7: These need privileged mode for mount/unshare
+          echo "=== Running privileged tests (with --privileged flag) ==="
+          
           # Test 4: Check mmdebstrap can create minimal chroot
           echo "=== Test 4: mmdebstrap minimal chroot creation ==="
-          docker run --rm rootfs-test:latest \
+          docker run --rm --privileged rootfs-test:latest \
             mmdebstrap --variant=minbase stable /tmp/test-chroot
           docker run --rm rootfs-test:latest test -d /tmp/test-chroot/usr/bin
           echo "✓ mmdebstrap successfully created test chroot"
           
           # Test 5: Check mmdebstrap can create tarball
           echo "=== Test 5: mmdebstrap tarball creation ==="
-          docker run --rm rootfs-test:latest \
+          docker run --rm --privileged rootfs-test:latest \
             mmdebstrap --format=tar stable /tmp/test.tar
           docker run --rm rootfs-test:latest test -f /tmp/test.tar
           echo "✓ Tarball created successfully"
           
           # Test 6: Check package installation
           echo "=== Test 6: Package installation ==="
-          docker run --rm rootfs-test:latest \
+          docker run --rm --privileged rootfs-test:latest \
             mmdebstrap --include=hello --variant=minbase stable /tmp/test-pkgs
           docker run --rm rootfs-test:latest test -f /tmp/test-pkgs/usr/bin/hello
           echo "✓ Package installation works"
           
-          # Test 7: Check build-essential availability
+          # Test 7: Check build-essential is available
           echo "=== Test 7: build-essential availability ==="
           docker run --rm rootfs-test:latest dpkg -l | grep build-essential || echo "build-essential installed"
           
@@ -360,16 +363,17 @@ jobs:
           # Build Docker image
           docker build -f Dockerfile.test -t local-rootfs-test .
           
-          # Run tests
+          # Non-privileged tests
           echo "=== mmdebstrap version ==="
           docker run --rm local-rootfs-test mmdebstrap --version
           
-          echo "=== Creating test chroot ==="
-          docker run --rm local-rootfs-test \
+          # Privileged tests (needed for mount/unshare)
+          echo "=== Creating test chroot (privileged mode) ==="
+          docker run --rm --privileged local-rootfs-test \
             mmdebstrap --variant=minbase stable /tmp/test-chroot
           
-          echo "=== Creating tarball ==="
-          docker run --rm local-rootfs-test \
+          echo "=== Creating tarball (privileged mode) ==="
+          docker run --rm --privileged local-rootfs-test \
             mmdebstrap --format=tar stable /tmp/test.tar
           
           echo "=== All tests passed ==="
@@ -434,9 +438,9 @@ jobs:
           echo "  - mmdebstrap version check"
           echo "  - Essential directories check"
           echo "  - apt update test"
-          echo "  - Minimal chroot creation test"
-          echo "  - Tarball creation test"
-          echo "  - Package installation test"
+          echo "  - Minimal chroot creation test (--privileged)"
+          echo "  - Tarball creation test (--privileged)"
+          echo "  - Package installation test (--privileged)"
           echo "  - build-essential check"
           echo "✓ Rootfs archived with maximum xz compression"
           echo "========================================"
