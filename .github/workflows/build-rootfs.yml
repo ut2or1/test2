@@ -20,7 +20,6 @@ jobs:
       # ============================================
       - name: Install system dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y \
             luajit \
             cdebootstrap-static \
@@ -28,11 +27,13 @@ jobs:
             wget \
             xz-utils \
             squashfs-tools \
-            tar
+            tar \
+            pixz  # parallel xz for faster compression
           
           echo "=== Verifying installations ==="
           luajit -v
           cdebootstrap-static --version
+          xz --version
       
       # ============================================
       # Step 2: Create minimal rootfs using cdebootstrap
@@ -68,7 +69,7 @@ jobs:
           sudo du -sh "$ROOTFS_DIR"
       
       # ============================================
-      # Step 3: Test mmdebstrap inside chroot (without LXC)
+      # Step 3: Test mmdebstrap functionality inside chroot
       # ============================================
       - name: Test mmdebstrap functionality
         run: |
@@ -159,39 +160,70 @@ jobs:
           sudo chroot "$ROOTFS_DIR" rm -rf /tmp/test-src
       
       # ============================================
-      # Step 6: Archive rootfs as artifact
+      # Step 6: Archive rootfs with maximum xz compression
       # ============================================
-      - name: Archive rootfs as artifact
+      - name: Archive rootfs with maximum xz compression
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           
-          echo "=== Compressing rootfs ==="
+          echo "=== Compressing rootfs with maximum xz compression ==="
+          echo "This may take several minutes due to high compression level..."
+          
+          # Method 1: Using tar with xz options (maximum compression)
+          # -J = xz compression
+          # -C = change to directory
+          # -c = create archive
+          # -f = output file
           cd "$ROOTFS_DIR"
-          sudo tar -czf "${{ github.workspace }}/rootfs.tar.gz" .
+          
+          # Maximum compression settings:
+          # -9e = extreme mode, maximum compression level
+          # T0 = use all CPU cores for compression (parallel)
+          # verbose = show progress
+          sudo tar -c . | xz -9e -T0 -v > "${{ github.workspace }}/rootfs.tar.xz"
+          
           cd "${{ github.workspace }}"
           
-          echo "=== Compressed rootfs size ==="
-          ls -lh rootfs.tar.gz
+          # Show compression statistics
+          echo "=== Compression statistics ==="
+          echo "Compressed file size:"
+          ls -lh rootfs.tar.xz
+          
+          echo ""
+          echo "Compression ratio:"
+          ORIGINAL_SIZE=$(sudo du -sb "$ROOTFS_DIR" | cut -f1)
+          COMPRESSED_SIZE=$(stat -c%s rootfs.tar.xz)
+          RATIO=$(echo "scale=2; $COMPRESSED_SIZE * 100 / $ORIGINAL_SIZE" | bc)
+          echo "Original: $ORIGINAL_SIZE bytes"
+          echo "Compressed: $COMPRESSED_SIZE bytes"
+          echo "Compression ratio: ${RATIO}% of original"
       
-      - name: Upload rootfs artifact
+      - name: Upload rootfs artifact (xz compressed)
         uses: actions/upload-artifact@v4
         with:
-          name: debian-rootfs-with-mmdebstrap
-          path: rootfs.tar.gz
-          retention-days: 1
-          compression-level: 6
+          name: debian-rootfs-with-mmdebstrap-xz
+          path: rootfs.tar.xz
+          retention-days: 7
+          compression-level: 0  # Disable additional compression since we already used max xz
       
       # ============================================
-      # Step 7: Create simple LXC config (for reference only)
+      # Step 7: Create LXC config template
       # ============================================
       - name: Generate LXC config template
         run: |
           cat << 'EOF' > lxc-config-template.conf
           # LXC configuration for the rootfs
-          # To use: extract rootfs.tar.gz and use this config
+          # To use: extract rootfs.tar.xz and use this config
+          #
+          # Extraction command:
+          # sudo mkdir -p /var/lib/lxc/builder/rootfs
+          # sudo tar -xJf rootfs.tar.xz -C /var/lib/lxc/builder/rootfs
           
-          lxc.rootfs.path = /path/to/extracted/rootfs
+          lxc.rootfs.path = /var/lib/lxc/builder/rootfs
           lxc.uts.name = debian-builder
+          
+          # Include Debian common configuration
+          lxc.include = /usr/share/lxc/config/debian.common.conf
           
           # Network configuration
           lxc.net.0.type = veth
@@ -205,6 +237,11 @@ jobs:
           
           # Console
           lxc.tty.max = 2
+          lxc.console.logfile = /var/log/lxc/builder/console.log
+          
+          # Uncomment for unprivileged containers (requires subuid/subgid configuration)
+          # lxc.idmap = u 0 100000 65536
+          # lxc.idmap = g 0 100000 65536
           EOF
           
           echo "=== LXC config template created ==="
@@ -215,10 +252,108 @@ jobs:
         with:
           name: lxc-config-template
           path: lxc-config-template.conf
+          retention-days: 7
+      
+      # ============================================
+      # Step 8: Create usage script for local deployment
+      # ============================================
+      - name: Generate deployment script
+        run: |
+          cat << 'EOF' > setup-lxc-container.sh
+          #!/bin/bash
+          # Script to setup LXC container from CI artifact on Debian 8
+          
+          set -e
+          
+          echo "=== Setting up LXC container from CI artifact ==="
+          
+          # Check if running as root
+          if [ "$EUID" -ne 0 ]; then 
+            echo "Please run as root (sudo ./setup-lxc-container.sh)"
+            exit 1
+          fi
+          
+          # Variables
+          CONTAINER_NAME="builder"
+          LXC_PATH="/var/lib/lxc/$CONTAINER_NAME"
+          ARTIFACT_FILE="rootfs.tar.xz"
+          
+          # Check if artifact exists
+          if [ ! -f "$ARTIFACT_FILE" ]; then
+            echo "Error: $ARTIFACT_FILE not found in current directory"
+            echo "Please download it from CI artifacts first"
+            exit 1
+          fi
+          
+          # Create container directory
+          echo "Creating container directory..."
+          mkdir -p "$LXC_PATH"
+          
+          # Extract rootfs
+          echo "Extracting rootfs with xz decompression..."
+          tar -xJf "$ARTIFACT_FILE" -C "$LXC_PATH/rootfs"
+          
+          # Copy config template if exists
+          if [ -f "lxc-config-template.conf" ]; then
+            echo "Copying LXC configuration..."
+            cp lxc-config-template.conf "$LXC_PATH/config"
+          else
+            echo "Warning: lxc-config-template.conf not found, using default config"
+          fi
+          
+          # Fix permissions
+          chown -R root:root "$LXC_PATH"
+          chmod 755 "$LXC_PATH"
+          chmod 755 "$LXC_PATH/rootfs"
+          
+          echo ""
+          echo "=== Container setup completed ==="
+          echo ""
+          echo "To start the container:"
+          echo "  sudo lxc-start -n $CONTAINER_NAME -d"
+          echo ""
+          echo "To attach to the container:"
+          echo "  sudo lxc-attach -n $CONTAINER_NAME"
+          echo ""
+          echo "To stop the container:"
+          echo "  sudo lxc-stop -n $CONTAINER_NAME"
+          echo ""
+          echo "To test mmdebstrap inside container:"
+          echo "  sudo lxc-attach -n $CONTAINER_NAME -- mmdebstrap --version"
+          EOF
+          
+          chmod +x setup-lxc-container.sh
+          echo "=== Deployment script created ==="
+      
+      - name: Upload deployment script
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-lxc-container-script
+          path: setup-lxc-container.sh
           retention-days: 1
       
       # ============================================
-      # Step 8: Display summary
+      # Step 9: Create checksum file for verification
+      # ============================================
+      - name: Generate checksums
+        run: |
+          echo "=== Generating SHA256 checksums ==="
+          sha256sum rootfs.tar.xz > rootfs.tar.xz.sha256
+          sha256sum lxc-config-template.conf >> rootfs.tar.xz.sha256
+          sha256sum setup-lxc-container.sh >> rootfs.tar.xz.sha256
+          
+          echo "=== Checksums ==="
+          cat rootfs.tar.xz.sha256
+      
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: rootfs.tar.xz.sha256
+          retention-days: 1
+      
+      # ============================================
+      # Step 10: Display summary
       # ============================================
       - name: Build summary
         run: |
@@ -231,22 +366,31 @@ jobs:
           echo "✓ mmdebstrap functional tests passed"
           echo "✓ Package installation test passed"
           echo "✓ deb-src support verified"
-          echo "✓ Rootfs archived as artifact"
+          echo "✓ Rootfs archived with maximum xz compression"
           echo "========================================"
           echo ""
           echo "Artifacts available for download:"
-          echo "  - debian-rootfs-with-mmdebstrap.tar.gz"
+          echo "  - debian-rootfs-with-mmdebstrap-xz.tar.xz (max xz compression)"
           echo "  - lxc-config-template.conf"
+          echo "  - setup-lxc-container.sh (automated setup script)"
+          echo "  - checksums (SHA256)"
           echo ""
-          echo "To use this rootfs with LXC on your local machine:"
-          echo "  1. Extract rootfs.tar.gz to /var/lib/lxc/mycontainer/rootfs"
-          echo "  2. Copy lxc-config-template.conf to /var/lib/lxc/mycontainer/config"
-          echo "  3. Adjust paths in config file"
-          echo "  4. Run: sudo lxc-start -n mycontainer"
+          echo "Compression details:"
+          echo "  - Algorithm: xz"
+          echo "  - Level: -9e (maximum)"
+          echo "  - Threads: All available CPU cores"
+          echo "  - Format: tar.xz"
+          echo ""
+          echo "To use this rootfs on your local Debian 8 system:"
+          echo "  1. Download all artifacts"
+          echo "  2. Run: sudo ./setup-lxc-container.sh"
+          echo "  3. Or manually:"
+          echo "     tar -xJf rootfs.tar.xz -C /var/lib/lxc/builder/rootfs"
+          echo "  4. Start container: sudo lxc-start -n builder -d"
           echo "========================================"
       
       # ============================================
-      # Step 9: Cleanup
+      # Step 11: Cleanup
       # ============================================
       - name: Cleanup
         if: always()
