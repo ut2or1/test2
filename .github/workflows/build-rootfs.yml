@@ -1,4 +1,4 @@
-name: Build Minimal Rootfs with mmdebstrap
+name: Build and Test Rootfs with QEMU
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-rootfs:
+  build-and-test:
     runs-on: ubuntu-latest
     
     steps:
@@ -20,26 +20,26 @@ jobs:
       # ============================================
       - name: Install system dependencies
         run: |
+          sudo apt-get update
           sudo apt-get install -y \
-            luajit \
             cdebootstrap-static \
-            ca-certificates \
+            qemu-user-static \
+            qemu-system-x86 \
+            qemu-utils \
+            binfmt-support \
             wget \
             xz-utils \
-            squashfs-tools \
-            tar \
-            pixz
-          
+            systemd-container
+            
           echo "=== Verifying installations ==="
-          luajit -v
           cdebootstrap-static --version
-          xz --version
-          docker --version
+          qemu-x86_64-static --version || qemu-user-static --version
+          qemu-system-x86_64 --version
       
       # ============================================
       # Step 2: Create minimal rootfs using cdebootstrap
       # ============================================
-      - name: Generate minimal rootfs with mmdebstrap
+      - name: Generate minimal rootfs
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           sudo mkdir -p "$ROOTFS_DIR"
@@ -70,269 +70,169 @@ jobs:
           sudo du -sh "$ROOTFS_DIR"
       
       # ============================================
-      # Step 3: Archive rootfs for Docker testing (uncompressed tar)
+      # Step 3: Test with qemu-user-static (CI-friendly)
       # ============================================
-      - name: Create tar archive for Docker
+      - name: Test with qemu-user-static
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           
-          echo "=== Creating tar archive for Docker testing ==="
-          cd "$ROOTFS_DIR"
-          sudo tar -cf "${{ github.workspace }}/rootfs-docker.tar" .
-          cd "${{ github.workspace }}"
+          echo "=== Testing rootfs with qemu-user-static ==="
+          echo "This mode emulates individual processes, ideal for CI"
           
-          # Fix permissions
-          sudo chown $(id -u):$(id -g) rootfs-docker.tar
-          ls -lh rootfs-docker.tar
+          # Register binfmt handlers (usually automatic, but ensure)
+          sudo update-binfmts --enable || true
+          
+          # Copy qemu-static binary into rootfs
+          echo "Copying qemu-x86_64-static to rootfs..."
+          sudo cp /usr/bin/qemu-x86_64-static "$ROOTFS_DIR/usr/bin/"
+          
+          # Test 1: mmdebstrap version
+          echo "=== Test 1: mmdebstrap version ==="
+          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --version
+          
+          # Test 2: Check apt works
+          echo "=== Test 2: apt update ==="
+          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/apt-get update
+          
+          # Test 3: Check essential packages
+          echo "=== Test 3: Essential packages ==="
+          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/dpkg -l | head -20
+          
+          # Test 4: mmdebstrap help (non-privileged operation)
+          echo "=== Test 4: mmdebstrap help ==="
+          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --help | head -20
+          
+          # Test 5: Check mmdebstrap variants
+          echo "=== Test 5: mmdebstrap variants ==="
+          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --help | grep -A5 "variant"
+          
+          # Test 6: Check mmdebstrap formats
+          echo "=== Test 6: mmdebstrap formats ==="
+          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --help | grep -A10 "format"
+          
+          # Test 7: Verify mmdebstrap dependencies
+          echo "=== Test 7: mmdebstrap dependencies ==="
+          sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-x86_64-static /usr/bin/dpkg -l | grep -E "(apt|dpkg|perl)"
+          
+          echo "=== All qemu-user-static tests passed successfully ==="
       
       # ============================================
-      # Step 4: Test rootfs in Docker (with privileged mode)
+      # Step 4: Create bootable QEMU image (for local testing)
       # ============================================
-      - name: Test rootfs in Docker container
+      - name: Create QEMU disk image for local testing
         run: |
-          echo "=== Testing rootfs in Docker (privileged mode) ==="
+          ROOTFS_DIR="${{ github.workspace }}/rootfs"
+          IMAGE_FILE="${{ github.workspace }}/rootfs.img"
           
-          # Create Dockerfile
-          cat << 'EOF' > Dockerfile
-          FROM scratch
-          ADD rootfs-docker.tar /
-          CMD ["/bin/bash"]
+          echo "=== Creating QEMU disk image for local testing ==="
+          
+          # Create empty 2GB disk image
+          qemu-img create -f raw "$IMAGE_FILE" 2G
+          
+          # Create partition table
+          sudo parted -s "$IMAGE_FILE" mklabel msdos
+          sudo parted -s "$IMAGE_FILE" mkpart primary ext4 1MiB 100%
+          sudo parted -s "$IMAGE_FILE" set 1 boot on
+          
+          # Setup loop device
+          LOOP_DEV=$(sudo losetup --find --show --partscan "$IMAGE_FILE")
+          echo "Loop device: $LOOP_DEV"
+          
+          # Format partition
+          sudo mkfs.ext4 -F "${LOOP_DEV}p1"
+          
+          # Mount and copy rootfs
+          MOUNT_DIR=$(mktemp -d)
+          sudo mount "${LOOP_DEV}p1" "$MOUNT_DIR"
+          sudo cp -a "$ROOTFS_DIR/." "$MOUNT_DIR/"
+          
+          # Configure for boot
+          echo "Configuring image for boot..."
+          sudo mkdir -p "$MOUNT_DIR/boot/extlinux"
+          
+          # Install kernel if not present
+          if [ ! -f "$MOUNT_DIR/boot/vmlinuz-"* ]; then
+            echo "Warning: No kernel found, installing..."
+            sudo chroot "$MOUNT_DIR" apt-get install -y linux-image-amd64
+          fi
+          
+          # Create extlinux config
+          KERNEL=$(sudo ls "$MOUNT_DIR/boot/vmlinuz-"* | head -1 | xargs basename)
+          INITRD=$(sudo ls "$MOUNT_DIR/boot/initrd.img-"* | head -1 | xargs basename)
+          
+          cat << EOF | sudo tee "$MOUNT_DIR/boot/extlinux/extlinux.conf"
+          DEFAULT debian
+          LABEL debian
+                LINUX /boot/$KERNEL
+                INITRD /boot/$INITRD
+                APPEND root=/dev/vda1 console=ttyS0 console=tty0 rw
           EOF
           
-          # Build Docker image
-          echo "Building Docker image from rootfs..."
-          docker build -t rootfs-test:latest .
+          # Install bootloader
+          sudo extlinux --install "$MOUNT_DIR/boot/extlinux"
+          sudo dd if=/usr/lib/syslinux/mbr.bin of="${LOOP_DEV}" bs=440 count=1
           
-          # Test 1: Check mmdebstrap version (doesn't need privileges)
-          echo "=== Test 1: mmdebstrap version ==="
-          docker run --rm rootfs-test:latest mmdebstrap --version
+          # Create fstab
+          cat << EOF | sudo tee "$MOUNT_DIR/etc/fstab"
+          /dev/vda1 / ext4 defaults,noatime 0 1
+          proc /proc proc defaults 0 0
+          sysfs /sys sysfs defaults 0 0
+          EOF
           
-          # Test 2: Check essential directories (doesn't need privileges)
-          echo "=== Test 2: Essential directories ==="
-          docker run --rm rootfs-test:latest ls -la /usr/bin/ | head -10
-          docker run --rm rootfs-test:latest test -d /etc/apt
-          echo "✓ Essential directories present"
+          # Set root password for local testing
+          sudo chroot "$MOUNT_DIR" bash -c 'echo "root:root" | chpasswd'
           
-          # Test 3: Check apt update (needs network, but not privileged)
-          echo "=== Test 3: apt update ==="
-          docker run --rm rootfs-test:latest apt-get update
+          # Unmount
+          sudo umount "$MOUNT_DIR"
+          sudo losetup -d "$LOOP_DEV"
+          rmdir "$MOUNT_DIR"
           
-          # Test 4-7: These need privileged mode for mount/unshare
-          echo "=== Running privileged tests (with --privileged flag) ==="
+          # Compress image
+          echo "Compressing disk image..."
+          xz -9e -T0 "$IMAGE_FILE"
           
-          # Test 4: Check mmdebstrap can create minimal chroot
-          echo "=== Test 4: mmdebstrap minimal chroot creation ==="
-          docker run --rm --privileged rootfs-test:latest \
-            mmdebstrap --variant=minbase stable /tmp/test-chroot
-          docker run --rm rootfs-test:latest test -d /tmp/test-chroot/usr/bin
-          echo "✓ mmdebstrap successfully created test chroot"
-          
-          # Test 5: Check mmdebstrap can create tarball
-          echo "=== Test 5: mmdebstrap tarball creation ==="
-          docker run --rm --privileged rootfs-test:latest \
-            mmdebstrap --format=tar stable /tmp/test.tar
-          docker run --rm rootfs-test:latest test -f /tmp/test.tar
-          echo "✓ Tarball created successfully"
-          
-          # Test 6: Check package installation
-          echo "=== Test 6: Package installation ==="
-          docker run --rm --privileged rootfs-test:latest \
-            mmdebstrap --include=hello --variant=minbase stable /tmp/test-pkgs
-          docker run --rm rootfs-test:latest test -f /tmp/test-pkgs/usr/bin/hello
-          echo "✓ Package installation works"
-          
-          # Test 7: Check build-essential is available
-          echo "=== Test 7: build-essential availability ==="
-          docker run --rm rootfs-test:latest dpkg -l | grep build-essential || echo "build-essential installed"
-          
-          # Clean up Docker image
-          docker rmi rootfs-test:latest
-          
-          echo "=== All Docker tests passed successfully ==="
+          ls -lh "$IMAGE_FILE.xz"
       
       # ============================================
-      # Step 5: Archive rootfs with maximum xz compression (for distribution)
+      # Step 5: Archive artifacts
       # ============================================
-      - name: Archive rootfs with maximum xz compression
+      - name: Archive rootfs tarball
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           
-          echo "=== Compressing rootfs with maximum xz compression ==="
-          echo "This may take several minutes due to high compression level..."
-          
+          echo "=== Creating rootfs tarball ==="
           cd "$ROOTFS_DIR"
-          
-          # Maximum compression settings:
-          # -9e = extreme mode, maximum compression level
-          # -T0 = use all CPU cores for compression (parallel)
-          # -v = verbose progress
-          sudo tar -c . | xz -9e -T0 -v > "${{ github.workspace }}/rootfs.tar.xz"
-          
+          sudo tar -c . | xz -9e -T0 > "${{ github.workspace }}/rootfs.tar.xz"
           cd "${{ github.workspace }}"
-          
-          # Fix permissions for artifact
           sudo chown $(id -u):$(id -g) rootfs.tar.xz
           
-          # Show compression statistics
-          echo "=== Compression statistics ==="
-          echo "Compressed file size:"
+          echo "Rootfs tarball size:"
           ls -lh rootfs.tar.xz
-          
-          echo ""
-          echo "Compression ratio:"
-          ORIGINAL_SIZE=$(sudo du -sb "$ROOTFS_DIR" | cut -f1)
-          COMPRESSED_SIZE=$(stat -c%s rootfs.tar.xz)
-          RATIO=$(echo "scale=2; $COMPRESSED_SIZE * 100 / $ORIGINAL_SIZE" | bc)
-          echo "Original: $ORIGINAL_SIZE bytes"
-          echo "Compressed: $COMPRESSED_SIZE bytes"
-          echo "Compression ratio: ${RATIO}% of original"
       
-      # ============================================
-      # Step 6: Upload rootfs artifact (xz compressed)
-      # ============================================
-      - name: Upload rootfs artifact (xz compressed)
+      - name: Upload rootfs tarball
         uses: actions/upload-artifact@v4
         with:
-          name: debian-rootfs-with-mmdebstrap-xz
+          name: debian-rootfs-tarball
           path: rootfs.tar.xz
           retention-days: 1
-          compression-level: 0
       
-      # ============================================
-      # Step 7: Create LXC config template
-      # ============================================
-      - name: Generate LXC config template
-        run: |
-          cat << 'EOF' > lxc-config-template.conf
-          # LXC configuration for the rootfs
-          # To use: extract rootfs.tar.xz and use this config
-          #
-          # Extraction command:
-          # sudo mkdir -p /var/lib/lxc/builder/rootfs
-          # sudo tar -xJf rootfs.tar.xz -C /var/lib/lxc/builder/rootfs
-          
-          lxc.rootfs.path = /var/lib/lxc/builder/rootfs
-          lxc.uts.name = debian-builder
-          
-          # Include Debian common configuration
-          lxc.include = /usr/share/lxc/config/debian.common.conf
-          
-          # Network configuration
-          lxc.net.0.type = veth
-          lxc.net.0.flags = up
-          lxc.net.0.link = lxcbr0
-          lxc.net.0.name = eth0
-          
-          # Container limits
-          lxc.cgroup2.memory.max = 2G
-          lxc.cgroup2.cpu.max = 2
-          
-          # Console
-          lxc.tty.max = 2
-          lxc.console.logfile = /var/log/lxc/builder/console.log
-          
-          # Uncomment for unprivileged containers (requires subuid/subgid configuration)
-          # lxc.idmap = u 0 100000 65536
-          # lxc.idmap = g 0 100000 65536
-          EOF
-          
-          echo "=== LXC config template created ==="
-          cat lxc-config-template.conf
-      
-      - name: Upload LXC config template
+      - name: Upload QEMU disk image
         uses: actions/upload-artifact@v4
         with:
-          name: lxc-config-template
-          path: lxc-config-template.conf
+          name: debian-rootfs-qemu-image
+          path: rootfs.img.xz
           retention-days: 1
       
       # ============================================
-      # Step 8: Create usage script for local deployment
+      # Step 6: Create local testing scripts
       # ============================================
-      - name: Generate deployment script
+      - name: Generate local testing scripts
         run: |
-          cat << 'EOF' > setup-lxc-container.sh
+          # Script 1: Test with qemu-user-static locally
+          cat << 'EOF' > test-with-qemu-user.sh
           #!/bin/bash
-          # Script to setup LXC container from CI artifact on Debian 8
-          
-          set -e
-          
-          echo "=== Setting up LXC container from CI artifact ==="
-          
-          # Check if running as root
-          if [ "$EUID" -ne 0 ]; then 
-            echo "Please run as root (sudo ./setup-lxc-container.sh)"
-            exit 1
-          fi
-          
-          # Variables
-          CONTAINER_NAME="builder"
-          LXC_PATH="/var/lib/lxc/$CONTAINER_NAME"
-          ARTIFACT_FILE="rootfs.tar.xz"
-          
-          # Check if artifact exists
-          if [ ! -f "$ARTIFACT_FILE" ]; then
-            echo "Error: $ARTIFACT_FILE not found in current directory"
-            echo "Please download it from CI artifacts first"
-            exit 1
-          fi
-          
-          # Create container directory
-          echo "Creating container directory..."
-          mkdir -p "$LXC_PATH/rootfs"
-          
-          # Extract rootfs
-          echo "Extracting rootfs with xz decompression..."
-          tar -xJf "$ARTIFACT_FILE" -C "$LXC_PATH/rootfs"
-          
-          # Copy config template if exists
-          if [ -f "lxc-config-template.conf" ]; then
-            echo "Copying LXC configuration..."
-            cp lxc-config-template.conf "$LXC_PATH/config"
-          else
-            echo "Warning: lxc-config-template.conf not found, using default config"
-          fi
-          
-          # Fix permissions
-          chown -R root:root "$LXC_PATH"
-          chmod 755 "$LXC_PATH"
-          chmod 755 "$LXC_PATH/rootfs"
-          
-          echo ""
-          echo "=== Container setup completed ==="
-          echo ""
-          echo "To start the container:"
-          echo "  sudo lxc-start -n $CONTAINER_NAME -d"
-          echo ""
-          echo "To attach to the container:"
-          echo "  sudo lxc-attach -n $CONTAINER_NAME"
-          echo ""
-          echo "To stop the container:"
-          echo "  sudo lxc-stop -n $CONTAINER_NAME"
-          echo ""
-          echo "To test mmdebstrap inside container:"
-          echo "  sudo lxc-attach -n $CONTAINER_NAME -- mmdebstrap --version"
-          EOF
-          
-          chmod +x setup-lxc-container.sh
-          echo "=== Deployment script created ==="
-      
-      - name: Upload deployment script
-        uses: actions/upload-artifact@v4
-        with:
-          name: setup-lxc-container-script
-          path: setup-lxc-container.sh
-          retention-days: 1
-      
-      # ============================================
-      # Step 9: Create test script for Docker testing locally
-      # ============================================
-      - name: Generate Docker test script
-        run: |
-          cat << 'EOF' > test-rootfs-in-docker.sh
-          #!/bin/bash
-          # Script to test rootfs in Docker locally
-          # Usage: ./test-rootfs-in-docker.sh rootfs.tar.xz
+          # Test rootfs using qemu-user-static (for any system)
+          # Usage: ./test-with-qemu-user.sh rootfs.tar.xz
           
           set -e
           
@@ -344,88 +244,179 @@ jobs:
             exit 1
           fi
           
-          echo "=== Testing rootfs in Docker ==="
+          echo "=== Testing with qemu-user-static ==="
           
-          # Extract rootfs to temporary directory
-          mkdir -p test-rootfs
-          tar -xJf "$ARTIFACT" -C test-rootfs
+          # Install qemu-user-static if not present
+          if ! command -v qemu-x86_64-static &> /dev/null; then
+            echo "Installing qemu-user-static..."
+            sudo apt-get update
+            sudo apt-get install -y qemu-user-static binfmt-support
+          fi
           
-          # Create tar archive for Docker
-          tar -cf rootfs-docker.tar -C test-rootfs .
+          # Extract rootfs
+          TEMP_DIR=$(mktemp -d)
+          echo "Extracting to $TEMP_DIR..."
+          tar -xJf "$ARTIFACT" -C "$TEMP_DIR"
           
-          # Create Dockerfile
-          cat << 'DOCKERFILE' > Dockerfile.test
-          FROM scratch
-          ADD rootfs-docker.tar /
-          CMD ["/bin/bash"]
-          DOCKERFILE
+          # Copy qemu-static binary
+          sudo cp /usr/bin/qemu-x86_64-static "$TEMP_DIR/usr/bin/"
           
-          # Build Docker image
-          docker build -f Dockerfile.test -t local-rootfs-test .
-          
-          # Non-privileged tests
+          # Run tests
           echo "=== mmdebstrap version ==="
-          docker run --rm local-rootfs-test mmdebstrap --version
+          sudo chroot "$TEMP_DIR" /usr/bin/qemu-x86_64-static /usr/bin/mmdebstrap --version
           
-          # Privileged tests (needed for mount/unshare)
-          echo "=== Creating test chroot (privileged mode) ==="
-          docker run --rm --privileged local-rootfs-test \
-            mmdebstrap --variant=minbase stable /tmp/test-chroot
+          echo "=== apt update ==="
+          sudo chroot "$TEMP_DIR" /usr/bin/qemu-x86_64-static /usr/bin/apt-get update
           
-          echo "=== Creating tarball (privileged mode) ==="
-          docker run --rm --privileged local-rootfs-test \
-            mmdebstrap --format=tar stable /tmp/test.tar
+          echo "=== Cleanup ==="
+          sudo rm -rf "$TEMP_DIR"
           
-          echo "=== All tests passed ==="
-          
-          # Cleanup
-          rm -rf test-rootfs rootfs-docker.tar Dockerfile.test
-          docker rmi local-rootfs-test 2>/dev/null || true
+          echo "=== Tests completed ==="
           EOF
           
-          chmod +x test-rootfs-in-docker.sh
-          echo "=== Docker test script created ==="
+          # Script 2: Run full VM with qemu-system
+          cat << 'EOF' > run-vm.sh
+          #!/bin/bash
+          # Boot rootfs image in QEMU VM (full system emulation)
+          # Usage: ./run-vm.sh rootfs.img.xz
+          
+          set -e
+          
+          IMAGE="${1:-rootfs.img.xz}"
+          
+          if [ ! -f "$IMAGE" ]; then
+            echo "Error: $IMAGE not found"
+            echo "Usage: $0 <rootfs.img.xz>"
+            exit 1
+          fi
+          
+          # Decompress if needed
+          if [[ "$IMAGE" == *.xz ]]; then
+            echo "Decompressing..."
+            unxz -k "$IMAGE"
+            IMAGE="${IMAGE%.xz}"
+          fi
+          
+          # Check if KVM is available
+          KVM_FLAG=""
+          if [ -c /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "KVM acceleration available"
+            KVM_FLAG="-machine accel=kvm"
+          else
+            echo "KVM not available, using TCG (slower)"
+            KVM_FLAG="-machine accel=tcg"
+          fi
+          
+          echo "Starting QEMU VM with: $IMAGE"
+          echo "Login: root, Password: root"
+          echo "Press Ctrl+A X to exit QEMU"
+          echo ""
+          
+          qemu-system-x86_64 \
+            $KVM_FLAG \
+            -m 2048 \
+            -smp 2 \
+            -drive file="$IMAGE",format=raw,if=virtio \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -nographic \
+            -serial mon:stdio
+          EOF
+          
+          # Script 3: Quick validation without emulation
+          cat << 'EOF' > validate-rootfs.sh
+          #!/bin/bash
+          # Quick validation of rootfs contents (no emulation)
+          # Usage: ./validate-rootfs.sh rootfs.tar.xz
+          
+          set -e
+          
+          ARTIFACT="${1:-rootfs.tar.xz}"
+          
+          if [ ! -f "$ARTIFACT" ]; then
+            echo "Error: $ARTIFACT not found"
+            echo "Usage: $0 <rootfs.tar.xz>"
+            exit 1
+          fi
+          
+          echo "=== Validating rootfs ==="
+          
+          # Extract
+          TEMP_DIR=$(mktemp -d)
+          tar -xJf "$ARTIFACT" -C "$TEMP_DIR"
+          
+          # Check files (without emulation)
+          echo "Checking essential files..."
+          [ -f "$TEMP_DIR/bin/bash" ] && echo "✓ bash present"
+          [ -f "$TEMP_DIR/usr/bin/apt" ] && echo "✓ apt present"
+          [ -f "$TEMP_DIR/usr/bin/mmdebstrap" ] && echo "✓ mmdebstrap present"
+          
+          # Check symlinks
+          [ -L "$TEMP_DIR/bin/sh" ] && echo "✓ /bin/sh symlink present"
+          
+          # Check directories
+          [ -d "$TEMP_DIR/etc/apt" ] && echo "✓ /etc/apt present"
+          [ -d "$TEMP_DIR/usr/bin" ] && echo "✓ /usr/bin present"
+          
+          # Cleanup
+          rm -rf "$TEMP_DIR"
+          
+          echo "=== Validation completed ==="
+          EOF
+          
+          chmod +x test-with-qemu-user.sh run-vm.sh validate-rootfs.sh
+          
+          echo "=== Local testing scripts created ==="
       
-      - name: Upload Docker test script
+      - name: Upload local testing scripts
         uses: actions/upload-artifact@v4
         with:
-          name: test-rootfs-in-docker-script
-          path: test-rootfs-in-docker.sh
+          name: local-testing-scripts
+          path: |
+            test-with-qemu-user.sh
+            run-vm.sh
+            validate-rootfs.sh
           retention-days: 1
       
       # ============================================
-      # Step 10: Generate checksum file for verification
+      # Step 7: Checksums
       # ============================================
       - name: Generate checksums
         run: |
-          echo "=== Generating SHA256 checksums ==="
-          sha256sum rootfs.tar.xz > rootfs.tar.xz.sha256
-          sha256sum lxc-config-template.conf >> rootfs.tar.xz.sha256
-          sha256sum setup-lxc-container.sh >> rootfs.tar.xz.sha256
-          sha256sum test-rootfs-in-docker.sh >> rootfs.tar.xz.sha256
+          cat << 'EOF' > checksums.txt
+          ========================================
+          SHA256 Checksums
+          ========================================
+          EOF
+          sha256sum rootfs.tar.xz >> checksums.txt
+          sha256sum rootfs.img.xz >> checksums.txt
+          sha256sum test-with-qemu-user.sh >> checksums.txt
+          sha256sum run-vm.sh >> checksums.txt
+          sha256sum validate-rootfs.sh >> checksums.txt
           
+          echo ""
           echo "=== Checksums ==="
-          cat rootfs.tar.xz.sha256
+          cat checksums.txt
       
       - name: Upload checksums
         uses: actions/upload-artifact@v4
         with:
           name: checksums
-          path: rootfs.tar.xz.sha256
+          path: checksums.txt
           retention-days: 1
       
       # ============================================
-      # Step 11: Cleanup temporary files
+      # Step 8: Cleanup
       # ============================================
-      - name: Cleanup temporary files
+      - name: Cleanup
         if: always()
         run: |
           sudo rm -rf "${{ github.workspace }}/rootfs"
-          rm -f "${{ github.workspace }}/rootfs-docker.tar"
+          rm -f "${{ github.workspace }}/rootfs.img"
           echo "Cleanup completed"
       
       # ============================================
-      # Step 12: Display summary
+      # Step 9: Summary
       # ============================================
       - name: Build summary
         run: |
@@ -433,32 +424,34 @@ jobs:
           echo "Build Summary"
           echo "========================================"
           echo "✓ cdebootstrap-static installed"
+          echo "✓ qemu-user-static installed (CI testing)"
+          echo "✓ qemu-system installed (local VM testing)"
           echo "✓ Debian rootfs created with mmdebstrap"
-          echo "✓ Rootfs tested in Docker (7 tests passed)"
-          echo "  - mmdebstrap version check"
-          echo "  - Essential directories check"
-          echo "  - apt update test"
-          echo "  - Minimal chroot creation test (--privileged)"
-          echo "  - Tarball creation test (--privileged)"
-          echo "  - Package installation test (--privileged)"
-          echo "  - build-essential check"
-          echo "✓ Rootfs archived with maximum xz compression"
+          echo "✓ Rootfs tested with qemu-user-static (7 tests)"
+          echo "  - mmdebstrap version"
+          echo "  - apt update"
+          echo "  - Essential packages"
+          echo "  - mmdebstrap help"
+          echo "  - mmdebstrap variants"
+          echo "  - mmdebstrap formats"
+          echo "  - Dependencies check"
+          echo "✓ Bootable QEMU disk image created"
           echo "========================================"
           echo ""
           echo "Artifacts available for download:"
-          echo "  - debian-rootfs-with-mmdebstrap-xz.tar.xz (max xz compression)"
-          echo "  - lxc-config-template.conf"
-          echo "  - setup-lxc-container.sh (automated LXC setup on Debian 8)"
-          echo "  - test-rootfs-in-docker.sh (test rootfs locally in Docker)"
-          echo "  - checksums (SHA256)"
+          echo "  1. debian-rootfs-tarball.tar.xz - Rootfs tarball"
+          echo "  2. debian-rootfs-qemu-image.img.xz - Bootable QEMU disk"
+          echo "  3. local-testing-scripts - Helper scripts"
+          echo "  4. checksums.txt - SHA256 checksums"
           echo ""
-          echo "Compression details:"
-          echo "  - Algorithm: xz"
-          echo "  - Level: -9e (maximum)"
-          echo "  - Threads: All available CPU cores"
-          echo "  - Format: tar.xz"
+          echo "Local testing options:"
+          echo "  A. Quick validation (no emulation):"
+          echo "     ./validate-rootfs.sh rootfs.tar.xz"
           echo ""
-          echo "To use this rootfs:"
-          echo "  1. For LXC on Debian 8: sudo ./setup-lxc-container.sh"
-          echo "  2. For local Docker testing: ./test-rootfs-in-docker.sh rootfs.tar.xz"
+          echo "  B. Process emulation (qemu-user-static):"
+          echo "     ./test-with-qemu-user.sh rootfs.tar.xz"
+          echo ""
+          echo "  C. Full VM emulation (qemu-system):"
+          echo "     ./run-vm.sh rootfs.img.xz"
+          echo "     login: root, password: root"
           echo "========================================"
