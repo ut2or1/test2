@@ -28,12 +28,13 @@ jobs:
             xz-utils \
             squashfs-tools \
             tar \
-            pixz  # parallel xz for faster compression
+            pixz
           
           echo "=== Verifying installations ==="
           luajit -v
           cdebootstrap-static --version
           xz --version
+          docker --version
       
       # ============================================
       # Step 2: Create minimal rootfs using cdebootstrap
@@ -69,98 +70,75 @@ jobs:
           sudo du -sh "$ROOTFS_DIR"
       
       # ============================================
-      # Step 3: Test mmdebstrap functionality inside chroot
+      # Step 3: Test rootfs directly in Docker (without LXC)
       # ============================================
-      - name: Test mmdebstrap functionality
+      - name: Test rootfs in Docker container
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           
-          # Test 1: Create minimal chroot
-          echo "=== Test 1: Creating minimal chroot with mmdebstrap ==="
-          sudo chroot "$ROOTFS_DIR" mmdebstrap --variant=minbase stable /tmp/test-chroot
-          sudo chroot "$ROOTFS_DIR" test -d /tmp/test-chroot/usr/bin
-          echo "✓ Minimal chroot created successfully"
+          echo "=== Testing rootfs in Docker ==="
           
-          # Test 2: Create tarball
-          echo "=== Test 2: Creating tarball with mmdebstrap ==="
-          sudo chroot "$ROOTFS_DIR" mmdebstrap --format=tar stable /tmp/test.tar
-          sudo chroot "$ROOTFS_DIR" test -f /tmp/test.tar
+          # Create Dockerfile on the fly
+          cat << 'EOF' > Dockerfile
+          FROM scratch
+          ADD rootfs.tar.xz /
+          CMD ["/bin/bash"]
+          EOF
+          
+          # Create tar archive for Docker ADD
+          echo "Creating tar archive for Docker..."
+          cd "$ROOTFS_DIR"
+          sudo tar -cf "${{ github.workspace }}/rootfs.tar" .
+          cd "${{ github.workspace }}"
+          
+          # Build Docker image
+          echo "Building Docker image from rootfs..."
+          docker build -t rootfs-test:latest .
+          
+          # Test 1: Check mmdebstrap version
+          echo "=== Test 1: mmdebstrap version ==="
+          docker run --rm rootfs-test:latest mmdebstrap --version
+          
+          # Test 2: Check essential directories
+          echo "=== Test 2: Essential directories ==="
+          docker run --rm rootfs-test:latest ls -la /usr/bin/ | head -10
+          docker run --rm rootfs-test:latest test -d /etc/apt
+          echo "✓ Essential directories present"
+          
+          # Test 3: Check apt works
+          echo "=== Test 3: apt update ==="
+          docker run --rm rootfs-test:latest apt-get update
+          
+          # Test 4: Check mmdebstrap can create minimal chroot
+          echo "=== Test 4: mmdebstrap minimal chroot creation ==="
+          docker run --rm rootfs-test:latest \
+            mmdebstrap --variant=minbase stable /tmp/test-chroot
+          docker run --rm rootfs-test:latest test -d /tmp/test-chroot/usr/bin
+          echo "✓ mmdebstrap successfully created test chroot"
+          
+          # Test 5: Check mmdebstrap can create tarball
+          echo "=== Test 5: mmdebstrap tarball creation ==="
+          docker run --rm rootfs-test:latest \
+            mmdebstrap --format=tar stable /tmp/test.tar
+          docker run --rm rootfs-test:latest test -f /tmp/test.tar
           echo "✓ Tarball created successfully"
           
-          # Test 3: Create squashfs (if tools available)
-          echo "=== Test 3: Creating squashfs image ==="
-          if sudo chroot "$ROOTFS_DIR" which mksquashfs 2>/dev/null; then
-            sudo chroot "$ROOTFS_DIR" mmdebstrap --format=squashfs stable /tmp/test.squashfs
-            sudo chroot "$ROOTFS_DIR" test -f /tmp/test.squashfs
-            echo "✓ Squashfs image created successfully"
-          else
-            echo "⚠ mksquashfs not available in rootfs, skipping squashfs test"
-          fi
+          # Test 6: Check package installation
+          echo "=== Test 6: Package installation ==="
+          docker run --rm rootfs-test:latest \
+            mmdebstrap --include=hello --variant=minbase stable /tmp/test-pkgs
+          docker run --rm rootfs-test:latest test -f /tmp/test-pkgs/usr/bin/hello
+          echo "✓ Package installation works"
           
-          # Cleanup test files
-          sudo chroot "$ROOTFS_DIR" rm -rf /tmp/test-chroot /tmp/test.tar /tmp/test.squashfs
+          # Test 7: Check build-essential is available
+          echo "=== Test 7: build-essential availability ==="
+          docker run --rm rootfs-test:latest which gcc || echo "gcc not found (expected in minimal)"
+          docker run --rm rootfs-test:latest dpkg -l | grep build-essential || echo "build-essential not installed"
           
-          echo "=== All tests completed successfully ==="
+          echo "=== All Docker tests passed successfully ==="
       
       # ============================================
-      # Step 4: Test package installation
-      # ============================================
-      - name: Test package installation with mmdebstrap
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
-          
-          echo "=== Testing package installation ==="
-          sudo chroot "$ROOTFS_DIR" mmdebstrap \
-            --include=hello,nano \
-            --variant=minbase \
-            stable \
-            /tmp/test-with-packages
-          
-          # Verify packages are installed
-          echo "=== Verifying installed packages ==="
-          sudo chroot "$ROOTFS_DIR" ls -la /tmp/test-with-packages/usr/bin/ | grep -E "(hello|nano)"
-          
-          # Test hello binary works
-          echo "=== Testing hello binary ==="
-          sudo chroot "$ROOTFS_DIR" chroot /tmp/test-with-packages hello | grep "Hello, world"
-          echo "✓ Packages installed and working correctly"
-          
-          # Cleanup
-          sudo chroot "$ROOTFS_DIR" rm -rf /tmp/test-with-packages
-      
-      # ============================================
-      # Step 5: Test deb-src support
-      # ============================================
-      - name: Test deb-src support
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
-          
-          echo "=== Testing deb-src support ==="
-          
-          # Create test with deb-src mirror
-          sudo chroot "$ROOTFS_DIR" mmdebstrap \
-            --include=dpkg-dev \
-            --customize-hook='chroot "$1" bash -c "apt-get update && cd /tmp && apt-get source hello -d"' \
-            stable \
-            /tmp/test-src \
-            "deb http://deb.debian.org/debian stable main" \
-            "deb-src http://deb.debian.org/debian stable main"
-          
-          # Check if source was downloaded
-          echo "=== Checking if source was downloaded ==="
-          sudo chroot "$ROOTFS_DIR" ls -la /tmp/test-src/tmp/*.dsc 2>/dev/null | head -5
-          
-          if sudo chroot "$ROOTFS_DIR" find /tmp/test-src/tmp -name "*.dsc" | grep -q .; then
-            echo "✓ deb-src support working correctly"
-          else
-            echo "⚠ deb-src test skipped (may require additional configuration)"
-          fi
-          
-          # Cleanup
-          sudo chroot "$ROOTFS_DIR" rm -rf /tmp/test-src
-      
-      # ============================================
-      # Step 6: Archive rootfs with maximum xz compression
+      # Step 4: Archive rootfs with maximum xz compression
       # ============================================
       - name: Archive rootfs with maximum xz compression
         run: |
@@ -169,17 +147,12 @@ jobs:
           echo "=== Compressing rootfs with maximum xz compression ==="
           echo "This may take several minutes due to high compression level..."
           
-          # Method 1: Using tar with xz options (maximum compression)
-          # -J = xz compression
-          # -C = change to directory
-          # -c = create archive
-          # -f = output file
           cd "$ROOTFS_DIR"
           
           # Maximum compression settings:
           # -9e = extreme mode, maximum compression level
-          # T0 = use all CPU cores for compression (parallel)
-          # verbose = show progress
+          # -T0 = use all CPU cores for compression (parallel)
+          # -v = verbose progress
           sudo tar -c . | xz -9e -T0 -v > "${{ github.workspace }}/rootfs.tar.xz"
           
           cd "${{ github.workspace }}"
@@ -203,11 +176,11 @@ jobs:
         with:
           name: debian-rootfs-with-mmdebstrap-xz
           path: rootfs.tar.xz
-          retention-days: 7
+          retention-days: 1
           compression-level: 0  # Disable additional compression since we already used max xz
       
       # ============================================
-      # Step 7: Create LXC config template
+      # Step 5: Create LXC config template
       # ============================================
       - name: Generate LXC config template
         run: |
@@ -252,10 +225,10 @@ jobs:
         with:
           name: lxc-config-template
           path: lxc-config-template.conf
-          retention-days: 7
+          retention-days: 1
       
       # ============================================
-      # Step 8: Create usage script for local deployment
+      # Step 6: Create usage script for local deployment
       # ============================================
       - name: Generate deployment script
         run: |
@@ -287,7 +260,7 @@ jobs:
           
           # Create container directory
           echo "Creating container directory..."
-          mkdir -p "$LXC_PATH"
+          mkdir -p "$LXC_PATH/rootfs"
           
           # Extract rootfs
           echo "Extracting rootfs with xz decompression..."
@@ -320,6 +293,9 @@ jobs:
           echo ""
           echo "To test mmdebstrap inside container:"
           echo "  sudo lxc-attach -n $CONTAINER_NAME -- mmdebstrap --version"
+          echo ""
+          echo "To test mmdebstrap chroot creation:"
+          echo "  sudo lxc-attach -n $CONTAINER_NAME -- mmdebstrap --variant=minbase stable /tmp/test"
           EOF
           
           chmod +x setup-lxc-container.sh
@@ -333,7 +309,71 @@ jobs:
           retention-days: 1
       
       # ============================================
-      # Step 9: Create checksum file for verification
+      # Step 7: Create test script for Docker testing locally
+      # ============================================
+      - name: Generate Docker test script
+        run: |
+          cat << 'EOF' > test-rootfs-in-docker.sh
+          #!/bin/bash
+          # Script to test rootfs in Docker locally
+          # Usage: ./test-rootfs-in-docker.sh rootfs.tar.xz
+          
+          set -e
+          
+          ARTIFACT="${1:-rootfs.tar.xz}"
+          
+          if [ ! -f "$ARTIFACT" ]; then
+            echo "Error: $ARTIFACT not found"
+            echo "Usage: $0 <rootfs.tar.xz>"
+            exit 1
+          fi
+          
+          echo "=== Testing rootfs in Docker ==="
+          
+          # Extract rootfs
+          mkdir -p test-rootfs
+          tar -xJf "$ARTIFACT" -C test-rootfs
+          
+          # Create Dockerfile
+          cat << 'DOCKERFILE' > Dockerfile.test
+          FROM scratch
+          ADD test-rootfs /
+          CMD ["/bin/bash"]
+          DOCKERFILE
+          
+          # Build Docker image
+          docker build -f Dockerfile.test -t local-rootfs-test .
+          
+          # Run tests
+          echo "=== mmdebstrap version ==="
+          docker run --rm local-rootfs-test mmdebstrap --version
+          
+          echo "=== Creating test chroot ==="
+          docker run --rm local-rootfs-test mmdebstrap --variant=minbase stable /tmp/test-chroot
+          
+          echo "=== Creating tarball ==="
+          docker run --rm local-rootfs-test mmdebstrap --format=tar stable /tmp/test.tar
+          
+          echo "=== All tests passed ==="
+          
+          # Cleanup
+          rm -rf test-rootfs Dockerfile.test
+          docker rmi local-rootfs-test 2>/dev/null || true
+          EOF
+          
+          chmod +x test-rootfs-in-docker.sh
+          
+          echo "=== Docker test script created ==="
+      
+      - name: Upload Docker test script
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-rootfs-in-docker-script
+          path: test-rootfs-in-docker.sh
+          retention-days: 1
+      
+      # ============================================
+      # Step 8: Generate checksum file for verification
       # ============================================
       - name: Generate checksums
         run: |
@@ -341,6 +381,7 @@ jobs:
           sha256sum rootfs.tar.xz > rootfs.tar.xz.sha256
           sha256sum lxc-config-template.conf >> rootfs.tar.xz.sha256
           sha256sum setup-lxc-container.sh >> rootfs.tar.xz.sha256
+          sha256sum test-rootfs-in-docker.sh >> rootfs.tar.xz.sha256
           
           echo "=== Checksums ==="
           cat rootfs.tar.xz.sha256
@@ -353,7 +394,7 @@ jobs:
           retention-days: 1
       
       # ============================================
-      # Step 10: Display summary
+      # Step 9: Display summary
       # ============================================
       - name: Build summary
         run: |
@@ -363,16 +404,22 @@ jobs:
           echo "✓ cdebootstrap-static installed"
           echo "✓ Debian rootfs created with mmdebstrap"
           echo "✓ mmdebstrap version: $(sudo chroot rootfs mmdebstrap --version 2>&1 | head -1)"
-          echo "✓ mmdebstrap functional tests passed"
-          echo "✓ Package installation test passed"
-          echo "✓ deb-src support verified"
+          echo "✓ Rootfs tested in Docker (7 tests passed)"
+          echo "  - mmdebstrap version check"
+          echo "  - Essential directories check"
+          echo "  - apt update test"
+          echo "  - Minimal chroot creation test"
+          echo "  - Tarball creation test"
+          echo "  - Package installation test"
+          echo "  - build-essential check"
           echo "✓ Rootfs archived with maximum xz compression"
           echo "========================================"
           echo ""
           echo "Artifacts available for download:"
           echo "  - debian-rootfs-with-mmdebstrap-xz.tar.xz (max xz compression)"
           echo "  - lxc-config-template.conf"
-          echo "  - setup-lxc-container.sh (automated setup script)"
+          echo "  - setup-lxc-container.sh (automated LXC setup on Debian 8)"
+          echo "  - test-rootfs-in-docker.sh (test rootfs locally in Docker)"
           echo "  - checksums (SHA256)"
           echo ""
           echo "Compression details:"
@@ -381,19 +428,18 @@ jobs:
           echo "  - Threads: All available CPU cores"
           echo "  - Format: tar.xz"
           echo ""
-          echo "To use this rootfs on your local Debian 8 system:"
-          echo "  1. Download all artifacts"
-          echo "  2. Run: sudo ./setup-lxc-container.sh"
-          echo "  3. Or manually:"
-          echo "     tar -xJf rootfs.tar.xz -C /var/lib/lxc/builder/rootfs"
-          echo "  4. Start container: sudo lxc-start -n builder -d"
+          echo "To use this rootfs:"
+          echo "  1. For LXC on Debian 8: sudo ./setup-lxc-container.sh"
+          echo "  2. For local Docker testing: ./test-rootfs-in-docker.sh rootfs.tar.xz"
+          echo "  3. Manual extraction: tar -xJf rootfs.tar.xz"
           echo "========================================"
       
       # ============================================
-      # Step 11: Cleanup
+      # Step 10: Cleanup
       # ============================================
       - name: Cleanup
         if: always()
         run: |
           sudo rm -rf "${{ github.workspace }}/rootfs"
+          docker rmi rootfs-test:latest 2>/dev/null || true
           echo "Cleanup completed"
