@@ -70,25 +70,32 @@ jobs:
           sudo du -sh "$ROOTFS_DIR"
       
       # ============================================
-      # Step 3: Test rootfs directly in Docker (without LXC)
+      # Step 3: Archive rootfs for Docker testing (uncompressed tar)
       # ============================================
-      - name: Test rootfs in Docker container
+      - name: Create tar archive for Docker
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           
-          echo "=== Testing rootfs in Docker ==="
-          
-          # Create tar archive for Docker (to same directory as Dockerfile)
-          echo "Creating tar archive for Docker..."
+          echo "=== Creating tar archive for Docker testing ==="
           cd "$ROOTFS_DIR"
-          sudo tar -cf "${{ github.workspace }}/rootfs.tar" .
-          sudo chown $(id -u):$(id -g) "${{ github.workspace }}/rootfs.tar"
+          sudo tar -cf "${{ github.workspace }}/rootfs-docker.tar" .
           cd "${{ github.workspace }}"
+          
+          # Fix permissions
+          sudo chown $(id -u):$(id -g) rootfs-docker.tar
+          ls -lh rootfs-docker.tar
+      
+      # ============================================
+      # Step 4: Test rootfs in Docker
+      # ============================================
+      - name: Test rootfs in Docker container
+        run: |
+          echo "=== Testing rootfs in Docker ==="
           
           # Create Dockerfile
           cat << 'EOF' > Dockerfile
           FROM scratch
-          ADD rootfs.tar /
+          ADD rootfs-docker.tar /
           CMD ["/bin/bash"]
           EOF
           
@@ -131,20 +138,17 @@ jobs:
           docker run --rm rootfs-test:latest test -f /tmp/test-pkgs/usr/bin/hello
           echo "✓ Package installation works"
           
-          # Test 7: Check build-essential is available
+          # Test 7: Check build-essential availability
           echo "=== Test 7: build-essential availability ==="
           docker run --rm rootfs-test:latest dpkg -l | grep build-essential || echo "build-essential installed"
           
           # Clean up Docker image
           docker rmi rootfs-test:latest
           
-          # Remove temporary tar file
-          rm -f rootfs.tar
-          
           echo "=== All Docker tests passed successfully ==="
       
       # ============================================
-      # Step 4: Archive rootfs with maximum xz compression
+      # Step 5: Archive rootfs with maximum xz compression (for distribution)
       # ============================================
       - name: Archive rootfs with maximum xz compression
         run: |
@@ -180,6 +184,9 @@ jobs:
           echo "Compressed: $COMPRESSED_SIZE bytes"
           echo "Compression ratio: ${RATIO}% of original"
       
+      # ============================================
+      # Step 6: Upload rootfs artifact (xz compressed)
+      # ============================================
       - name: Upload rootfs artifact (xz compressed)
         uses: actions/upload-artifact@v4
         with:
@@ -189,7 +196,7 @@ jobs:
           compression-level: 0
       
       # ============================================
-      # Step 5: Create LXC config template
+      # Step 7: Create LXC config template
       # ============================================
       - name: Generate LXC config template
         run: |
@@ -237,7 +244,7 @@ jobs:
           retention-days: 1
       
       # ============================================
-      # Step 6: Create usage script for local deployment
+      # Step 8: Create usage script for local deployment
       # ============================================
       - name: Generate deployment script
         run: |
@@ -315,7 +322,7 @@ jobs:
           retention-days: 1
       
       # ============================================
-      # Step 7: Create test script for Docker testing locally
+      # Step 9: Create test script for Docker testing locally
       # ============================================
       - name: Generate Docker test script
         run: |
@@ -340,10 +347,13 @@ jobs:
           mkdir -p test-rootfs
           tar -xJf "$ARTIFACT" -C test-rootfs
           
+          # Create tar archive for Docker
+          tar -cf rootfs-docker.tar -C test-rootfs .
+          
           # Create Dockerfile
           cat << 'DOCKERFILE' > Dockerfile.test
           FROM scratch
-          ADD test-rootfs /
+          ADD rootfs-docker.tar /
           CMD ["/bin/bash"]
           DOCKERFILE
           
@@ -365,12 +375,11 @@ jobs:
           echo "=== All tests passed ==="
           
           # Cleanup
-          rm -rf test-rootfs Dockerfile.test
+          rm -rf test-rootfs rootfs-docker.tar Dockerfile.test
           docker rmi local-rootfs-test 2>/dev/null || true
           EOF
           
           chmod +x test-rootfs-in-docker.sh
-          
           echo "=== Docker test script created ==="
       
       - name: Upload Docker test script
@@ -381,7 +390,7 @@ jobs:
           retention-days: 1
       
       # ============================================
-      # Step 8: Generate checksum file for verification
+      # Step 10: Generate checksum file for verification
       # ============================================
       - name: Generate checksums
         run: |
@@ -402,7 +411,17 @@ jobs:
           retention-days: 1
       
       # ============================================
-      # Step 9: Display summary
+      # Step 11: Cleanup temporary files
+      # ============================================
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          sudo rm -rf "${{ github.workspace }}/rootfs"
+          rm -f "${{ github.workspace }}/rootfs-docker.tar"
+          echo "Cleanup completed"
+      
+      # ============================================
+      # Step 12: Display summary
       # ============================================
       - name: Build summary
         run: |
@@ -411,7 +430,6 @@ jobs:
           echo "========================================"
           echo "✓ cdebootstrap-static installed"
           echo "✓ Debian rootfs created with mmdebstrap"
-          echo "✓ mmdebstrap version: $(sudo chroot rootfs mmdebstrap --version 2>&1 | head -1)"
           echo "✓ Rootfs tested in Docker (7 tests passed)"
           echo "  - mmdebstrap version check"
           echo "  - Essential directories check"
@@ -440,13 +458,3 @@ jobs:
           echo "  1. For LXC on Debian 8: sudo ./setup-lxc-container.sh"
           echo "  2. For local Docker testing: ./test-rootfs-in-docker.sh rootfs.tar.xz"
           echo "========================================"
-      
-      # ============================================
-      # Step 10: Cleanup
-      # ============================================
-      - name: Cleanup
-        if: always()
-        run: |
-          sudo rm -rf "${{ github.workspace }}/rootfs"
-          sudo rm -f "${{ github.workspace }}/rootfs.tar"
-          echo "Cleanup completed"
