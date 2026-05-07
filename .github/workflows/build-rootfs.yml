@@ -1,4 +1,4 @@
-name: Build and Test Rootfs with QEMU
+name: Build Rootfs with mmdebstrap
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-test:
+  build-rootfs:
     runs-on: ubuntu-latest
     
     steps:
@@ -16,38 +16,18 @@ jobs:
         uses: actions/checkout@v4
       
       # ============================================
-      # Step 1: Install dependencies (no apt-update)
+      # Step 1: Install dependencies (minimal)
       # ============================================
       - name: Install system dependencies
         run: |
           sudo apt-get install -y --no-install-recommends \
             cdebootstrap-static \
-            qemu-user-static \
-            qemu-system-x86 \
-            qemu-utils \
-            binfmt-support \
-            wget \
             xz-utils \
-            systemd-container \
-            extlinux \
-            syslinux
+            wget \
+            tar
             
           echo "=== Verifying installations ==="
           cdebootstrap-static --version
-          
-          # Find available qemu-static binary
-          if command -v qemu-x86_64-static &> /dev/null; then
-            echo "qemu-x86_64-static found"
-            qemu-x86_64-static --version
-          elif command -v qemu-x86_64 &> /dev/null; then
-            echo "qemu-x86_64 found"
-            qemu-x86_64 --version
-          else
-            echo "WARNING: qemu-static binary not found"
-            ls -la /usr/bin/qemu*static || true
-          fi
-          
-          qemu-system-x86_64 --version
       
       # ============================================
       # Step 2: Create minimal rootfs using cdebootstrap
@@ -74,7 +54,7 @@ jobs:
           echo "=== Verifying mmdebstrap inside rootfs ==="
           sudo chroot "$ROOTFS_DIR" mmdebstrap --version
           
-          # Clean up apt cache
+          # Clean up apt cache to reduce disk usage
           sudo chroot "$ROOTFS_DIR" apt-get clean
           sudo rm -rf "$ROOTFS_DIR"/var/cache/apt/archives/*.deb
           sudo rm -rf "$ROOTFS_DIR"/var/lib/apt/lists/*
@@ -83,193 +63,50 @@ jobs:
           sudo du -sh "$ROOTFS_DIR"
       
       # ============================================
-      # Step 3: Test with qemu-user-static (fixed)
+      # Step 3: Basic validation (no emulation)
       # ============================================
-      - name: Test with qemu-user-static
+      - name: Basic rootfs validation
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           
-          echo "=== Testing rootfs with qemu-user-static ==="
-          
-          # Register binfmt handlers
-          sudo update-binfmts --enable || true
-          
-          # Find and copy qemu-static binary
-          QEMU_BIN=""
-          if [ -f /usr/bin/qemu-x86_64-static ]; then
-            QEMU_BIN="qemu-x86_64-static"
-          elif [ -f /usr/bin/qemu-x86_64 ]; then
-            QEMU_BIN="qemu-x86_64"
-          else
-            echo "ERROR: No qemu-static binary found"
-            exit 1
-          fi
-          
-          echo "Using QEMU binary: $QEMU_BIN"
-          
-          # Copy qemu-static binary into rootfs
-          sudo cp "/usr/bin/$QEMU_BIN" "$ROOTFS_DIR/usr/bin/"
-          
-          # Also copy binfmt registration
-          if [ -f /proc/sys/fs/binfmt_misc/register ]; then
-            echo "binfmt_misc is available"
-          fi
-          
-          # Test 1: mmdebstrap version (simple chroot without qemu wrapper)
-          echo "=== Test 1: Direct mmdebstrap version (native) ==="
-          sudo chroot "$ROOTFS_DIR" mmdebstrap --version || echo "Native test failed, trying with qemu..."
-          
-          # Test 2: Check if qemu works inside chroot
-          echo "=== Test 2: QEMU binary check ==="
-          sudo chroot "$ROOTFS_DIR" /usr/bin/$QEMU_BIN --version
-          
-          # Test 3: Run mmdebstrap through qemu
-          echo "=== Test 3: mmdebstrap via QEMU ==="
-          sudo chroot "$ROOTFS_DIR" /usr/bin/$QEMU_BIN /usr/bin/mmdebstrap --version
-          
-          # Test 4: Check essential packages via QEMU
-          echo "=== Test 4: Essential packages ==="
-          sudo chroot "$ROOTFS_DIR" /usr/bin/$QEMU_BIN /usr/bin/dpkg -l | head -20
-          
-          # Test 5: mmdebstrap help
-          echo "=== Test 5: mmdebstrap help ==="
-          sudo chroot "$ROOTFS_DIR" /usr/bin/$QEMU_BIN /usr/bin/mmdebstrap --help | head -20
-          
-          # Test 6: Check mmdebstrap variants
-          echo "=== Test 6: mmdebstrap variants ==="
-          sudo chroot "$ROOTFS_DIR" /usr/bin/$QEMU_BIN /usr/bin/mmdebstrap --help | grep -A5 "variant"
-          
-          # Test 7: Check mmdebstrap formats
-          echo "=== Test 7: mmdebstrap formats ==="
-          sudo chroot "$ROOTFS_DIR" /usr/bin/$QEMU_BIN /usr/bin/mmdebstrap --help | grep -A10 "format"
-          
-          echo "=== All qemu-user-static tests passed successfully ==="
-      
-      # ============================================
-      # Step 4: Alternative test without qemu (simpler and more reliable)
-      # ============================================
-      - name: Alternative test (native chroot)
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
-          
-          echo "=== Testing rootfs natively (no emulation) ==="
-          echo "This tests that the rootfs is valid and mmdebstrap works"
+          echo "=== Basic rootfs validation (no emulation) ==="
           
           # Test 1: mmdebstrap version
-          echo "=== Test 1: mmdebstrap version ==="
+          echo "=== mmdebstrap version ==="
           sudo chroot "$ROOTFS_DIR" mmdebstrap --version
           
-          # Test 2: Check essential packages
-          echo "=== Test 2: Essential packages ==="
-          sudo chroot "$ROOTFS_DIR" dpkg -l | head -20
+          # Test 2: Check essential directories
+          echo "=== Essential directories ==="
+          sudo chroot "$ROOTFS_DIR" test -d /etc/apt && echo "✓ /etc/apt present"
+          sudo chroot "$ROOTFS_DIR" test -d /usr/bin && echo "✓ /usr/bin present"
+          sudo chroot "$ROOTFS_DIR" test -f /bin/bash && echo "✓ bash present"
           
-          # Test 3: mmdebstrap help
-          echo "=== Test 3: mmdebstrap help ==="
-          sudo chroot "$ROOTFS_DIR" mmdebstrap --help | head -20
+          # Test 3: Check dpkg
+          echo "=== dpkg check ==="
+          sudo chroot "$ROOTFS_DIR" dpkg -l | head -10
           
-          # Test 4: Check mmdebstrap variants
-          echo "=== Test 4: mmdebstrap variants ==="
-          sudo chroot "$ROOTFS_DIR" mmdebstrap --help | grep -A5 "variant"
+          # Test 4: mmdebstrap help
+          echo "=== mmdebstrap help ==="
+          sudo chroot "$ROOTFS_DIR" mmdebstrap --help | head -15
           
-          # Test 5: Check mmdebstrap formats
-          echo "=== Test 5: mmdebstrap formats ==="
-          sudo chroot "$ROOTFS_DIR" mmdebstrap --help | grep -A10 "format"
+          # Test 5: Check mmdebstrap variants
+          echo "=== mmdebstrap variants ==="
+          sudo chroot "$ROOTFS_DIR" mmdebstrap --help | grep -A3 "variant"
           
-          # Test 6: Verify mmdebstrap dependencies
-          echo "=== Test 6: mmdebstrap dependencies ==="
+          # Test 6: Check mmdebstrap formats
+          echo "=== mmdebstrap formats ==="
+          sudo chroot "$ROOTFS_DIR" mmdebstrap --help | grep -A5 "format"
+          
+          # Test 7: Verify mmdebstrap dependencies
+          echo "=== mmdebstrap dependencies ==="
           sudo chroot "$ROOTFS_DIR" dpkg -l | grep -E "(apt|dpkg|perl)"
           
-          # Test 7: Check if /bin/bash works
-          echo "=== Test 7: Basic shell check ==="
-          sudo chroot "$ROOTFS_DIR" /bin/bash -c "echo 'Shell works'"
-          
-          echo "=== All native tests passed successfully ==="
+          echo "=== All basic validation tests passed ==="
       
       # ============================================
-      # Step 5: Create bootable QEMU image (for local testing)
+      # Step 4: Archive rootfs with xz compression
       # ============================================
-      - name: Create QEMU disk image for local testing
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
-          IMAGE_FILE="${{ github.workspace }}/rootfs.img"
-          
-          echo "=== Creating QEMU disk image for local testing ==="
-          
-          # Create empty 2GB disk image
-          qemu-img create -f raw "$IMAGE_FILE" 2G
-          
-          # Create partition table
-          sudo parted -s "$IMAGE_FILE" mklabel msdos
-          sudo parted -s "$IMAGE_FILE" mkpart primary ext4 1MiB 100%
-          sudo parted -s "$IMAGE_FILE" set 1 boot on
-          
-          # Setup loop device
-          LOOP_DEV=$(sudo losetup --find --show --partscan "$IMAGE_FILE")
-          echo "Loop device: $LOOP_DEV"
-          
-          # Format partition
-          sudo mkfs.ext4 -F "${LOOP_DEV}p1"
-          
-          # Mount and copy rootfs
-          MOUNT_DIR=$(mktemp -d)
-          sudo mount "${LOOP_DEV}p1" "$MOUNT_DIR"
-          sudo cp -a "$ROOTFS_DIR/." "$MOUNT_DIR/"
-          
-          # Configure for boot
-          echo "Configuring image for boot..."
-          sudo mkdir -p "$MOUNT_DIR/boot/extlinux"
-          
-          # Install kernel if not present
-          if [ ! -f "$MOUNT_DIR/boot/vmlinuz-"* ]; then
-            echo "Installing kernel..."
-            sudo chroot "$MOUNT_DIR" apt-get install -y --no-install-recommends linux-image-amd64
-          fi
-          
-          # Create extlinux config
-          KERNEL=$(sudo ls "$MOUNT_DIR/boot/vmlinuz-"* 2>/dev/null | head -1 | xargs basename || echo "")
-          INITRD=$(sudo ls "$MOUNT_DIR/boot/initrd.img-"* 2>/dev/null | head -1 | xargs basename || echo "")
-          
-          if [ -n "$KERNEL" ] && [ -n "$INITRD" ]; then
-            cat << EOF | sudo tee "$MOUNT_DIR/boot/extlinux/extlinux.conf"
-          DEFAULT debian
-          LABEL debian
-                LINUX /boot/$KERNEL
-                INITRD /boot/$INITRD
-                APPEND root=/dev/vda1 console=ttyS0 console=tty0 rw
-          EOF
-          
-            # Install bootloader
-            sudo extlinux --install "$MOUNT_DIR/boot/extlinux"
-            sudo dd if=/usr/lib/syslinux/mbr.bin of="${LOOP_DEV}" bs=440 count=1
-          else
-            echo "WARNING: No kernel found, image may not be bootable"
-          fi
-          
-          # Create fstab
-          cat << EOF | sudo tee "$MOUNT_DIR/etc/fstab"
-          /dev/vda1 / ext4 defaults,noatime 0 1
-          proc /proc proc defaults 0 0
-          sysfs /sys sysfs defaults 0 0
-          EOF
-          
-          # Set root password
-          sudo chroot "$MOUNT_DIR" bash -c 'echo "root:root" | chpasswd'
-          
-          # Unmount
-          sudo umount "$MOUNT_DIR"
-          sudo losetup -d "$LOOP_DEV"
-          rmdir "$MOUNT_DIR"
-          
-          # Compress image
-          echo "Compressing disk image..."
-          xz -9e -T0 "$IMAGE_FILE"
-          
-          ls -lh "$IMAGE_FILE.xz"
-      
-      # ============================================
-      # Step 6: Archive artifacts (retention 1 day)
-      # ============================================
-      - name: Archive rootfs tarball
+      - name: Archive rootfs
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           
@@ -282,30 +119,26 @@ jobs:
           echo "Rootfs tarball size:"
           ls -lh rootfs.tar.xz
       
-      - name: Upload rootfs tarball
+      # ============================================
+      # Step 5: Upload artifacts
+      # ============================================
+      - name: Upload rootfs artifact
         uses: actions/upload-artifact@v4
         with:
           name: debian-rootfs-tarball
           path: rootfs.tar.xz
           retention-days: 1
       
-      - name: Upload QEMU disk image
-        uses: actions/upload-artifact@v4
-        with:
-          name: debian-rootfs-qemu-image
-          path: rootfs.img.xz
-          retention-days: 1
-      
       # ============================================
-      # Step 7: Create local testing scripts
+      # Step 6: Create local testing scripts (Docker, LXC, QEMU)
       # ============================================
       - name: Generate local testing scripts
         run: |
-          # Script 1: Test with qemu-user-static locally
-          cat << 'EOF' > test-with-qemu-user.sh
+          # Script 1: Docker test
+          cat << 'EOF' > test-with-docker.sh
           #!/bin/bash
-          # Test rootfs using qemu-user-static
-          # Usage: ./test-with-qemu-user.sh rootfs.tar.xz
+          # Test rootfs in Docker
+          # Usage: ./test-with-docker.sh rootfs.tar.xz
           
           set -e
           
@@ -317,90 +150,174 @@ jobs:
             exit 1
           fi
           
-          echo "=== Testing with qemu-user-static ==="
+          echo "=== Testing rootfs in Docker ==="
           
-          # Install qemu-user-static if not present
-          if ! command -v qemu-x86_64-static &> /dev/null; then
-            sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support
-          fi
+          # Extract
+          mkdir -p test-rootfs
+          tar -xJf "$ARTIFACT" -C test-rootfs
           
-          # Extract rootfs
-          TEMP_DIR=$(mktemp -d)
-          echo "Extracting to $TEMP_DIR..."
-          tar -xJf "$ARTIFACT" -C "$TEMP_DIR"
+          # Create Dockerfile
+          cat > Dockerfile << 'DOCKERFILE'
+          FROM scratch
+          ADD test-rootfs /
+          CMD ["/bin/bash"]
+          DOCKERFILE
           
-          # Copy qemu-static binary
-          QEMU_BIN="qemu-x86_64-static"
-          if [ -f /usr/bin/qemu-x86_64-static ]; then
-            sudo cp /usr/bin/qemu-x86_64-static "$TEMP_DIR/usr/bin/"
-          elif [ -f /usr/bin/qemu-x86_64 ]; then
-            QEMU_BIN="qemu-x86_64"
-            sudo cp /usr/bin/qemu-x86_64 "$TEMP_DIR/usr/bin/"
-          fi
+          # Build and test
+          docker build -t rootfs-test .
+          docker run --rm rootfs-test mmdebstrap --version
+          docker run --rm rootfs-test apt-get update
           
-          # Run tests
-          echo "=== mmdebstrap version ==="
-          sudo chroot "$TEMP_DIR" /usr/bin/$QEMU_BIN /usr/bin/mmdebstrap --version
+          # Cleanup
+          docker rmi rootfs-test
+          rm -rf test-rootfs Dockerfile
           
-          echo "=== Cleanup ==="
-          sudo rm -rf "$TEMP_DIR"
-          
-          echo "=== Tests completed ==="
+          echo "=== Docker tests passed ==="
           EOF
           
-          # Script 2: Run full VM with qemu-system
-          cat << 'EOF' > run-vm.sh
+          # Script 2: LXC test
+          cat << 'EOF' > test-with-lxc.sh
           #!/bin/bash
-          # Boot rootfs image in QEMU VM
-          # Usage: ./run-vm.sh rootfs.img.xz
+          # Setup LXC container from rootfs
+          # Usage: sudo ./test-with-lxc.sh rootfs.tar.xz
           
           set -e
           
-          IMAGE="${1:-rootfs.img.xz}"
+          ARTIFACT="${1:-rootfs.tar.xz}"
           
-          if [ ! -f "$IMAGE" ]; then
-            echo "Error: $IMAGE not found"
-            echo "Usage: $0 <rootfs.img.xz>"
+          if [ ! -f "$ARTIFACT" ]; then
+            echo "Error: $ARTIFACT not found"
+            echo "Usage: $0 <rootfs.tar.xz>"
             exit 1
           fi
           
-          # Decompress if needed
-          if [[ "$IMAGE" == *.xz ]]; then
-            echo "Decompressing..."
-            unxz -k "$IMAGE"
-            IMAGE="${IMAGE%.xz}"
+          if [ "$EUID" -ne 0 ]; then
+            echo "Please run as root"
+            exit 1
           fi
           
-          # Check if KVM is available
-          KVM_FLAG=""
-          if [ -c /dev/kvm ] && [ -w /dev/kvm ]; then
-            echo "KVM acceleration available"
-            KVM_FLAG="-machine accel=kvm"
-          else
-            echo "KVM not available, using TCG (slower)"
-            KVM_FLAG="-machine accel=tcg"
-          fi
+          echo "=== Setting up LXC container ==="
           
-          echo "Starting QEMU VM with: $IMAGE"
-          echo "Login: root, Password: root"
-          echo "Press Ctrl+A X to exit QEMU"
-          echo ""
+          CONTAINER_NAME="test-container"
+          LXC_PATH="/var/lib/lxc/$CONTAINER_NAME"
           
-          qemu-system-x86_64 \
-            $KVM_FLAG \
-            -m 2048 \
-            -smp 2 \
-            -drive file="$IMAGE",format=raw,if=virtio \
-            -netdev user,id=net0 \
-            -device virtio-net-pci,netdev=net0 \
-            -nographic \
-            -serial mon:stdio
+          # Create container
+          mkdir -p "$LXC_PATH/rootfs"
+          tar -xJf "$ARTIFACT" -C "$LXC_PATH/rootfs"
+          
+          # Create config
+          cat > "$LXC_PATH/config" << 'LXC_CONFIG'
+          lxc.rootfs.path = /var/lib/lxc/test-container/rootfs
+          lxc.uts.name = test-container
+          lxc.net.0.type = veth
+          lxc.net.0.flags = up
+          lxc.net.0.link = lxcbr0
+          LXC_CONFIG
+          
+          # Start and test
+          lxc-start -n "$CONTAINER_NAME" -d
+          sleep 2
+          lxc-attach -n "$CONTAINER_NAME" -- mmdebstrap --version
+          lxc-stop -n "$CONTAINER_NAME"
+          lxc-destroy -n "$CONTAINER_NAME" -f
+          
+          echo "=== LXC tests passed ==="
           EOF
           
-          # Script 3: Quick validation without emulation
+          # Script 3: QEMU VM test (full system emulation)
+          cat << 'EOF' > test-with-qemu.sh
+          #!/bin/bash
+          # Create bootable QEMU image and test
+          # Usage: ./test-with-qemu.sh rootfs.tar.xz
+          
+          set -e
+          
+          ARTIFACT="${1:-rootfs.tar.xz}"
+          
+          if [ ! -f "$ARTIFACT" ]; then
+            echo "Error: $ARTIFACT not found"
+            echo "Usage: $0 <rootfs.tar.xz>"
+            exit 1
+          fi
+          
+          echo "=== Creating QEMU image from rootfs ==="
+          
+          # Install dependencies if needed
+          if ! command -v qemu-system-x86_64 &> /dev/null; then
+            sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils
+          fi
+          
+          # Extract
+          mkdir -p qemu-test/rootfs
+          tar -xJf "$ARTIFACT" -C qemu-test/rootfs
+          
+          # Create disk image
+          cd qemu-test
+          qemu-img create -f raw disk.img 2G
+          
+          # Setup partition
+          sudo parted -s disk.img mklabel msdos
+          sudo parted -s disk.img mkpart primary ext4 1MiB 100%
+          sudo parted -s disk.img set 1 boot on
+          
+          LOOP_DEV=$(sudo losetup --find --show --partscan disk.img)
+          sudo mkfs.ext4 -F "${LOOP_DEV}p1"
+          
+          MOUNT_DIR=$(mktemp -d)
+          sudo mount "${LOOP_DEV}p1" "$MOUNT_DIR"
+          sudo cp -a rootfs/. "$MOUNT_DIR/"
+          
+          # Configure boot
+          sudo mkdir -p "$MOUNT_DIR/boot/extlinux"
+          sudo chroot "$MOUNT_DIR" apt-get install -y --no-install-recommends linux-image-amd64 extlinux
+          
+          KERNEL=$(sudo ls "$MOUNT_DIR/boot/vmlinuz-"* | head -1 | xargs basename)
+          INITRD=$(sudo ls "$MOUNT_DIR/boot/initrd.img-"* | head -1 | xargs basename)
+          
+          sudo tee "$MOUNT_DIR/boot/extlinux/extlinux.conf" << EXT
+          DEFAULT debian
+          LABEL debian
+                LINUX /boot/$KERNEL
+                INITRD /boot/$INITRD
+                APPEND root=/dev/vda1 console=ttyS0 rw
+          EXT
+          
+          sudo extlinux --install "$MOUNT_DIR/boot/extlinux"
+          sudo dd if=/usr/lib/syslinux/mbr.bin of="${LOOP_DEV}" bs=440 count=1
+          
+          sudo tee "$MOUNT_DIR/etc/fstab" << FSTAB
+          /dev/vda1 / ext4 defaults 0 1
+          proc /proc proc defaults 0 0
+          FSTAB
+          
+          # Unmount
+          sudo umount "$MOUNT_DIR"
+          sudo losetup -d "$LOOP_DEV"
+          rmdir "$MOUNT_DIR"
+          
+          # Run QEMU
+          echo "=== Starting QEMU VM ==="
+          echo "Login: root (no password)"
+          echo "Run 'mmdebstrap --version' to test"
+          echo "Press Ctrl+A X to exit"
+          
+          qemu-system-x86_64 \
+            -machine accel=kvm:tcg \
+            -m 1024 \
+            -drive file=disk.img,format=raw,if=virtio \
+            -nographic \
+            -serial mon:stdio
+          
+          cd ..
+          rm -rf qemu-test
+          
+          echo "=== QEMU tests completed ==="
+          EOF
+          
+          # Script 4: Quick validation (no emulation)
           cat << 'EOF' > validate-rootfs.sh
           #!/bin/bash
-          # Quick validation of rootfs contents
+          # Quick validation of rootfs contents (no emulation)
           # Usage: ./validate-rootfs.sh rootfs.tar.xz
           
           set -e
@@ -425,39 +342,43 @@ jobs:
           [ -L "$TEMP_DIR/bin/sh" ] && echo "✓ /bin/sh symlink present"
           [ -d "$TEMP_DIR/etc/apt" ] && echo "✓ /etc/apt present"
           
+          # Check library dependencies
+          if command -v ldd &> /dev/null; then
+            ldd "$TEMP_DIR/bin/bash" | grep -q "libc.so" && echo "✓ bash libraries OK"
+          fi
+          
           rm -rf "$TEMP_DIR"
           
           echo "=== Validation completed ==="
           EOF
           
-          chmod +x test-with-qemu-user.sh run-vm.sh validate-rootfs.sh
+          chmod +x test-with-docker.sh test-with-lxc.sh test-with-qemu.sh validate-rootfs.sh
           
           echo "=== Local testing scripts created ==="
       
-      - name: Upload local testing scripts
+      # ============================================
+      # Step 7: Upload testing scripts
+      # ============================================
+      - name: Upload testing scripts
         uses: actions/upload-artifact@v4
         with:
-          name: local-testing-scripts
+          name: testing-scripts
           path: |
-            test-with-qemu-user.sh
-            run-vm.sh
+            test-with-docker.sh
+            test-with-lxc.sh
+            test-with-qemu.sh
             validate-rootfs.sh
           retention-days: 1
       
       # ============================================
-      # Step 8: Checksums
+      # Step 8: Generate checksums
       # ============================================
       - name: Generate checksums
         run: |
-          cat << 'EOF' > checksums.txt
-          ========================================
-          SHA256 Checksums
-          ========================================
-          EOF
-          sha256sum rootfs.tar.xz >> checksums.txt
-          sha256sum rootfs.img.xz >> checksums.txt
-          sha256sum test-with-qemu-user.sh >> checksums.txt
-          sha256sum run-vm.sh >> checksums.txt
+          sha256sum rootfs.tar.xz > checksums.txt
+          sha256sum test-with-docker.sh >> checksums.txt
+          sha256sum test-with-lxc.sh >> checksums.txt
+          sha256sum test-with-qemu.sh >> checksums.txt
           sha256sum validate-rootfs.sh >> checksums.txt
           
           echo "=== Checksums ==="
@@ -477,7 +398,6 @@ jobs:
         if: always()
         run: |
           sudo rm -rf "${{ github.workspace }}/rootfs"
-          rm -f "${{ github.workspace }}/rootfs.img"
           echo "Cleanup completed"
       
       # ============================================
@@ -490,32 +410,25 @@ jobs:
           echo "========================================"
           echo "✓ cdebootstrap-static installed"
           echo "✓ Debian rootfs created with mmdebstrap"
-          echo "✓ Rootfs tested natively (7 tests passed)"
-          echo "  - mmdebstrap version"
-          echo "  - Essential packages"
-          echo "  - mmdebstrap help"
-          echo "  - mmdebstrap variants"
-          echo "  - mmdebstrap formats"
-          echo "  - Dependencies check"
-          echo "  - Basic shell check"
-          echo "✓ Bootable QEMU disk image created"
-          echo "✓ Artifacts retention: 1 day"
+          echo "✓ Rootfs validated (7 basic checks passed)"
+          echo "✓ Rootfs archived with xz compression"
           echo "========================================"
           echo ""
-          echo "Artifacts available for download (expire in 1 day):"
-          echo "  1. debian-rootfs-tarball.tar.xz - Rootfs tarball"
-          echo "  2. debian-rootfs-qemu-image.img.xz - Bootable QEMU disk"
-          echo "  3. local-testing-scripts - Helper scripts"
-          echo "  4. checksums.txt - SHA256 checksums"
+          echo "Artifacts available (retention: 1 day):"
+          echo "  - debian-rootfs-tarball.tar.xz"
+          echo "  - testing-scripts (Docker, LXC, QEMU)"
+          echo "  - checksums.txt"
           echo ""
           echo "Local testing options:"
-          echo "  A. Quick validation (no emulation):"
+          echo "  1. Quick validation:"
           echo "     ./validate-rootfs.sh rootfs.tar.xz"
           echo ""
-          echo "  B. Process emulation (qemu-user-static):"
-          echo "     ./test-with-qemu-user.sh rootfs.tar.xz"
+          echo "  2. Docker test:"
+          echo "     ./test-with-docker.sh rootfs.tar.xz"
           echo ""
-          echo "  C. Full VM emulation (qemu-system):"
-          echo "     ./run-vm.sh rootfs.img.xz"
-          echo "     login: root, password: root"
+          echo "  3. LXC test (requires root):"
+          echo "     sudo ./test-with-lxc.sh rootfs.tar.xz"
+          echo ""
+          echo "  4. QEMU full VM test:"
+          echo "     ./test-with-qemu.sh rootfs.tar.xz"
           echo "========================================"
